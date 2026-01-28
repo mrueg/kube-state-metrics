@@ -81,6 +81,11 @@ func NewMetricsWriter(resourceName string, stores ...*MetricsStore) *MetricsWrit
 	}
 }
 
+// Stores returns the underlying stores.
+func (m *MetricsWriter) Stores() []*MetricsStore {
+	return m.stores
+}
+
 // WriteAll writes out metrics from the underlying stores to the given writer.
 //
 // WriteAll writes metrics so that the ones with the same name

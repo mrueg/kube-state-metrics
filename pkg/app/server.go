@@ -330,6 +330,16 @@ func RunKubeStateMetrics(ctx context.Context, opts *options.Options) error {
 	storesCtx, stopStores := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopStores()
 
+	// Run OTLP Exporter
+	if opts.EnableOTLPExport {
+		ctxOTLP, cancelOTLP := context.WithCancel(ctx)
+		g.Add(func() error {
+			return m.RunOTLPExport(ctxOTLP)
+		}, func(error) {
+			cancelOTLP()
+		})
+	}
+
 	tlsConfig := opts.TLSConfig
 
 	// A nil CRS config implies that we need to hold off on all CRS operations.

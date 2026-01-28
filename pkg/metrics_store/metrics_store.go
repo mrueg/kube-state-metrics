@@ -36,6 +36,9 @@ type MetricsStore struct {
 	// metric families, containing a slice of metrics. It's a pointer so cloned stores can
 	// safely share the same backing storage without copying or mutating it.
 	metrics *sync.Map
+	// families points to a sync.Map indexed by Kubernetes object id, containing
+	// the generated metric families of the object, for Export.
+	families *sync.Map
 
 	// lastResourceVersion points to a string containing the last resource version seen.
 	// It's a pointer so cloned stores can safely share the same resource version.
@@ -93,6 +96,7 @@ func NewMetricsStore(headers []string, generateFunc func(any) []metric.FamilyInt
 		headersTextPlain:      headersTextPlain,
 		metricNames:           metricNames,
 		metrics:               &sync.Map{},
+		families:              &sync.Map{},
 		lastResourceVersion:   &rv,
 		lastResourceVersionMu: &sync.RWMutex{},
 	}
@@ -131,6 +135,7 @@ func (s *MetricsStore) Add(obj any) error {
 	// bookkeeping is skipped here.
 	if r, ok := obj.(*renderedObject); ok {
 		s.metrics.Store(r.uid, r.families)
+		s.families.Store(r.uid, r.generated)
 		return nil
 	}
 
@@ -159,6 +164,7 @@ func (s *MetricsStore) Add(obj any) error {
 	families := s.generateMetricsFunc(obj)
 
 	s.metrics.Store(o.GetUID(), renderFamilies(families))
+	s.families.Store(o.GetUID(), families)
 
 	return nil
 }
@@ -243,6 +249,7 @@ func (s *MetricsStore) Delete(obj any) error {
 
 	s.setLastResourceVersion(o.GetResourceVersion())
 
+	s.families.Delete(o.GetUID())
 	if _, loaded := s.metrics.LoadAndDelete(o.GetUID()); loaded && s.objectLimit > 0 {
 		s.objectCount--
 	}
@@ -294,6 +301,7 @@ func (s *MetricsStore) Replace(list []any, resourceVersion string) error {
 			kept++
 		} else {
 			s.metrics.Delete(key)
+			s.families.Delete(key)
 		}
 		return true
 	})
@@ -335,9 +343,11 @@ func (s *MetricsStore) Transformer() cache.TransformFunc {
 		if err != nil {
 			return obj, nil
 		}
+		generated := s.generateMetricsFunc(obj)
 		return &renderedObject{
-			uid:      o.GetUID(),
-			families: renderFamilies(s.generateMetricsFunc(obj)),
+			uid:       o.GetUID(),
+			families:  renderFamilies(generated),
+			generated: generated,
 		}, nil
 	}
 }
@@ -345,8 +355,9 @@ func (s *MetricsStore) Transformer() cache.TransformFunc {
 // renderedObject stands in for an object in the reflector's temporary store and
 // holds the metrics already generated from it.
 type renderedObject struct {
-	uid      types.UID
-	families [][]byte
+	uid       types.UID
+	families  [][]byte
+	generated []metric.FamilyInterface
 }
 
 // Bookmark implements the Bookmark method of the store interface.
@@ -365,4 +376,14 @@ func (s *MetricsStore) setLastResourceVersion(rv string) {
 	s.lastResourceVersionMu.Lock()
 	defer s.lastResourceVersionMu.Unlock()
 	*s.lastResourceVersion = rv
+}
+
+// Export exports the metrics in the store.
+func (s *MetricsStore) Export() [][]metric.FamilyInterface {
+	var allFamilies [][]metric.FamilyInterface
+	s.families.Range(func(_, value any) bool {
+		allFamilies = append(allFamilies, value.([]metric.FamilyInterface))
+		return true
+	})
+	return allFamilies
 }
