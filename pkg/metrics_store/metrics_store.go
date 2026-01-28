@@ -24,6 +24,11 @@ import (
 	"k8s.io/kube-state-metrics/v2/pkg/metric"
 )
 
+type metricEntry struct {
+	families []metric.FamilyInterface
+	bytes    [][]byte
+}
+
 // MetricsStore implements the k8s.io/client-go/tools/cache.Store
 // interface. Instead of storing entire Kubernetes objects, it stores metrics
 // generated based on those objects.
@@ -100,7 +105,10 @@ func (s *MetricsStore) Add(obj interface{}) error {
 
 	families := s.generateMetricsFunc(obj)
 
-	s.metrics.Store(o.GetUID(), renderFamilies(families))
+	s.metrics.Store(o.GetUID(), metricEntry{
+		families: families,
+		bytes:    renderFamilies(families),
+	})
 
 	return nil
 }
@@ -236,4 +244,15 @@ func (s *MetricsStore) setLastResourceVersion(rv string) {
 	s.lastResourceVersionMu.Lock()
 	defer s.lastResourceVersionMu.Unlock()
 	*s.lastResourceVersion = rv
+}
+
+// Export exports the metrics in the store.
+func (s *MetricsStore) Export() [][]metric.FamilyInterface {
+	var allFamilies [][]metric.FamilyInterface
+	s.metrics.Range(func(_, value interface{}) bool {
+		entry := value.(metricEntry)
+		allFamilies = append(allFamilies, entry.families)
+		return true
+	})
+	return allFamilies
 }

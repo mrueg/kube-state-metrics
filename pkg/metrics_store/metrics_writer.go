@@ -71,6 +71,11 @@ func NewMetricsWriter(resourceName string, stores ...*MetricsStore) *MetricsWrit
 	}
 }
 
+// Stores returns the underlying stores.
+func (m *MetricsWriter) Stores() []*MetricsStore {
+	return m.stores
+}
+
 // WriteAll writes out metrics from the underlying stores to the given writer.
 //
 // WriteAll writes metrics so that the ones with the same name
@@ -120,7 +125,7 @@ func (m MetricsWriter) WriteAll(w io.Writer) error {
 
 		for _, s := range m.stores {
 			s.metrics.Range(func(_ interface{}, value interface{}) bool {
-				metricFamilies := value.([][]byte)
+				metricFamilies := value.(metricEntry).bytes
 				_, err = w.Write(metricFamilies[i])
 				if err != nil {
 					err = fmt.Errorf("failed to write metrics family: %w", err)

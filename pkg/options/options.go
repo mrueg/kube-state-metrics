@@ -79,6 +79,13 @@ type Options struct {
 	ServerIdleTimeout       time.Duration `yaml:"server_idle_timeout"`
 	ServerReadHeaderTimeout time.Duration `yaml:"server_read_header_timeout"`
 
+	EnableOTLPExport bool          `yaml:"enable_otlp_export"`
+	OTLPEndpoint     string        `yaml:"otlp_endpoint"`
+	OTLPProtocol     string        `yaml:"otlp_protocol"`
+	OTLPInsecure     bool          `yaml:"otlp_insecure"`
+	OTLPInterval     time.Duration `yaml:"otlp_interval"`
+	OTLPURLPath      string        `yaml:"otlp_url_path"`
+
 	Shard                int32 `yaml:"shard"`
 	AutoGoMemlimit       bool  `yaml:"auto-gomemlimit"`
 	CustomResourcesOnly  bool  `yaml:"custom_resources_only"`
@@ -191,6 +198,13 @@ func (o *Options) AddFlags(cmd *cobra.Command) {
 	o.cmd.Flags().DurationVar(&o.ServerWriteTimeout, "server-write-timeout", defaultServerWriteTimeout, "The maximum duration before timing out writes of the response. Align with the scrape interval or timeout of scraping clients..")
 	o.cmd.Flags().DurationVar(&o.ServerIdleTimeout, "server-idle-timeout", defaultServerIdleTimeout, "The maximum amount of time to wait for the next request when keep-alives are enabled. Align with the idletimeout of your scrape clients.")
 	o.cmd.Flags().DurationVar(&o.ServerReadHeaderTimeout, "server-read-header-timeout", defaultServerReadHeaderTimeout, "The maximum duration for reading the header of requests.")
+
+	o.cmd.Flags().BoolVar(&o.EnableOTLPExport, "enable-otlp-export", false, "Enable export of metrics via OTLP. (experimental)")
+	o.cmd.Flags().StringVar(&o.OTLPEndpoint, "otlp-endpoint", "", "The endpoint for OTLP export. (experimental)")
+	o.cmd.Flags().StringVar(&o.OTLPProtocol, "otlp-protocol", "grpc", "The protocol for OTLP export (grpc or http). (experimental)")
+	o.cmd.Flags().BoolVar(&o.OTLPInsecure, "otlp-insecure", false, "Enable insecure OTLP connection. (experimental)")
+	o.cmd.Flags().DurationVar(&o.OTLPInterval, "otlp-interval", 60*time.Second, "The interval for OTLP export. (experimental)")
+	o.cmd.Flags().StringVar(&o.OTLPURLPath, "otlp-url-path", "", "The URL path for OTLP HTTP export. (experimental)")
 }
 
 // Parse parses the flag definitions from the argument list.
@@ -222,6 +236,15 @@ func (o *Options) Validate() error {
 
 	if o.ObjectLimit < 0 {
 		return fmt.Errorf("value for --object-limit=%d must be equal or greater than 0", o.ObjectLimit)
+	}
+
+	if o.EnableOTLPExport {
+		if o.OTLPEndpoint == "" {
+			return fmt.Errorf("--otlp-endpoint must be set when --enable-otlp-export is true")
+		}
+		if o.OTLPProtocol != "grpc" && o.OTLPProtocol != "http" {
+			return fmt.Errorf("--otlp-protocol must be either 'grpc' or 'http'")
+		}
 	}
 
 	return nil
