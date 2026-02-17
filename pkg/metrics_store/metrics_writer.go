@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 
 	"github.com/prometheus/common/expfmt"
 
@@ -35,6 +36,13 @@ var (
 	infoTypeString     = string(metric.Info)
 	stateSetTypeString = string(metric.StateSet)
 	gaugeTypeString    = string(metric.Gauge)
+
+	// stringBuilderPool pools strings.Builder instances to reduce allocations
+	stringBuilderPool = sync.Pool{
+		New: func() interface{} {
+			return &strings.Builder{}
+		},
+	}
 )
 
 // MetricsWriterList represent a list of MetricsWriter
@@ -277,7 +285,8 @@ func SanitizeHeaders(contentType expfmt.Format, writers MetricsWriterList) Metri
 				// 1. Everything before TYPE line
 				// 2. Modified TYPE line
 				// 3. Everything after TYPE line
-				var sb strings.Builder
+				sb := stringBuilderPool.Get().(*strings.Builder)
+				sb.Reset()
 				sb.Grow(len(header) + len(gaugeTypeString) - len(infoTypeString) + 1)
 				sb.WriteString(header[:typeIdx])
 				sb.WriteString(newTypeLine)
@@ -294,6 +303,7 @@ func SanitizeHeaders(contentType expfmt.Format, writers MetricsWriterList) Metri
 				}
 
 				writer.stores[0].headers[i] = sb.String()
+				stringBuilderPool.Put(sb)
 			}
 		}
 	}
