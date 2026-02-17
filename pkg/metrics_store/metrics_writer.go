@@ -97,7 +97,7 @@ func (m MetricsWriter) WriteAll(w io.Writer) error {
 
 		var err error
 		m.stores[0].metrics.Range(func(_ interface{}, _ interface{}) bool {
-			_, err = w.Write([]byte(help))
+			_, err = io.WriteString(w, help)
 			if err != nil {
 				err = fmt.Errorf("failed to write help text: %v", err)
 			}
@@ -158,22 +158,41 @@ func SanitizeHeaders(contentType expfmt.Format, writers MetricsWriterList) Metri
 		if len(writer.stores) > 0 {
 			for i := 0; i < len(writer.stores[0].headers); i++ {
 				header := writer.stores[0].headers[i]
-				lines := strings.Split(header, "\n")
-				shouldRemove := false
-				modifiedLines := make([]string, 0, len(lines))
+				if header == "" {
+					continue
+				}
 
-				for _, line := range lines {
+				// First pass: check if we need to modify this header
+				shouldRemove := false
+				needsModification := false
+				var helpMetricName, typeMetricName string
+
+				rest := header
+				for rest != "" {
+					var line string
+					idx := strings.IndexByte(rest, '\n')
+					if idx != -1 {
+						line = rest[:idx]
+						rest = rest[idx+1:]
+					} else {
+						line = rest
+						rest = ""
+					}
+
+					if line == "" && rest == "" {
+						break
+					}
+
 					switch {
 					case strings.HasPrefix(line, helpPrefix):
 						metricName, ok := metricNameFromHeaderLine(line, helpPrefix)
 						if ok {
+							helpMetricName = metricName
 							if _, seen := seenHELP[metricName]; seen {
 								shouldRemove = true
 								break
 							}
-							seenHELP[metricName] = struct{}{}
 						}
-						modifiedLines = append(modifiedLines, line)
 
 					case strings.HasPrefix(line, typePrefix):
 						if shouldRemove {
@@ -181,37 +200,85 @@ func SanitizeHeaders(contentType expfmt.Format, writers MetricsWriterList) Metri
 						}
 						metricName, ok := metricNameFromHeaderLine(line, typePrefix)
 						if ok {
-							modifiedLine := line
+							typeMetricName = metricName
+							// Check if this type line needs modification
 							if isTextPlain {
-								if strings.HasSuffix(line, infoTypeString) {
-									modifiedLine = line[:len(line)-len(infoTypeString)] + gaugeTypeString
-								} else if strings.HasSuffix(line, stateSetTypeString) {
-									modifiedLine = line[:len(line)-len(stateSetTypeString)] + gaugeTypeString
+								if strings.HasSuffix(line, infoTypeString) || strings.HasSuffix(line, stateSetTypeString) {
+									needsModification = true
 								}
 							}
 							if _, seen := seenTYPE[metricName]; seen {
 								shouldRemove = true
 								break
 							}
-							seenTYPE[metricName] = struct{}{}
-							modifiedLines = append(modifiedLines, modifiedLine)
-						} else {
-							modifiedLines = append(modifiedLines, line)
 						}
-					default:
-						modifiedLines = append(modifiedLines, line)
+					}
+					if shouldRemove {
+						break
 					}
 				}
 
+				// Handle removal case
 				if shouldRemove {
 					writer.stores[0].headers[i] = ""
-				} else if len(modifiedLines) > 0 {
-					hdr := strings.Join(modifiedLines, "\n")
-					if hdr != "" && !strings.HasSuffix(hdr, "\n") {
-						hdr += "\n"
-					}
-					writer.stores[0].headers[i] = hdr
+					continue
 				}
+
+				// Mark as seen
+				if helpMetricName != "" {
+					seenHELP[helpMetricName] = struct{}{}
+				}
+				if typeMetricName != "" {
+					seenTYPE[typeMetricName] = struct{}{}
+				}
+
+				// Fast path: no modification needed
+				if !needsModification {
+					// Ensure header ends with newline (original behavior)
+					if !strings.HasSuffix(header, "\n") {
+						writer.stores[0].headers[i] = header + "\n"
+					}
+					continue
+				}
+
+				// Slow path: rebuild header with modifications
+				var sb strings.Builder
+				sb.Grow(len(header) + 1)
+
+				rest = header
+				for rest != "" {
+					var line string
+					idx := strings.IndexByte(rest, '\n')
+					if idx != -1 {
+						line = rest[:idx]
+						rest = rest[idx+1:]
+					} else {
+						line = rest
+						rest = ""
+					}
+
+					if line == "" && rest == "" {
+						break
+					}
+
+					switch {
+					case strings.HasPrefix(line, typePrefix):
+						// Apply type modifications
+						modifiedLine := line
+						if strings.HasSuffix(line, infoTypeString) {
+							modifiedLine = line[:len(line)-len(infoTypeString)] + gaugeTypeString
+						} else if strings.HasSuffix(line, stateSetTypeString) {
+							modifiedLine = line[:len(line)-len(stateSetTypeString)] + gaugeTypeString
+						}
+						sb.WriteString(modifiedLine)
+						sb.WriteByte('\n')
+					default:
+						sb.WriteString(line)
+						sb.WriteByte('\n')
+					}
+				}
+
+				writer.stores[0].headers[i] = sb.String()
 			}
 		}
 	}
