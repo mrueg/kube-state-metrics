@@ -241,41 +241,53 @@ func SanitizeHeaders(contentType expfmt.Format, writers MetricsWriterList) Metri
 					continue
 				}
 
-				// Slow path: rebuild header with modifications
+				// Surgical replacement: only modify the TYPE line
+				// This avoids parsing every line and allocating a StringBuilder for each
+				typeIdx := strings.Index(header, typePrefix)
+				if typeIdx == -1 {
+					// Should not happen if needsModification is true, but be defensive
+					continue
+				}
+
+				// Find the end of the TYPE line
+				lineEnd := strings.IndexByte(header[typeIdx:], '\n')
+				if lineEnd == -1 {
+					lineEnd = len(header) - typeIdx
+				}
+				typeLine := header[typeIdx : typeIdx+lineEnd]
+
+				// Determine the replacement
+				var newTypeLine string
+				if strings.HasSuffix(typeLine, infoTypeString) {
+					newTypeLine = typeLine[:len(typeLine)-len(infoTypeString)] + gaugeTypeString
+				} else if strings.HasSuffix(typeLine, stateSetTypeString) {
+					newTypeLine = typeLine[:len(typeLine)-len(stateSetTypeString)] + gaugeTypeString
+				} else {
+					// No modification needed after all
+					if !strings.HasSuffix(header, "\n") {
+						writer.stores[0].headers[i] = header + "\n"
+					}
+					continue
+				}
+
+				// Build the new header by concatenating three parts:
+				// 1. Everything before TYPE line
+				// 2. Modified TYPE line
+				// 3. Everything after TYPE line
 				var sb strings.Builder
-				sb.Grow(len(header) + 1)
-
-				rest = header
-				for rest != "" {
-					var line string
-					idx := strings.IndexByte(rest, '\n')
-					if idx != -1 {
-						line = rest[:idx]
-						rest = rest[idx+1:]
-					} else {
-						line = rest
-						rest = ""
-					}
-
-					if line == "" && rest == "" {
-						break
-					}
-
-					switch {
-					case strings.HasPrefix(line, typePrefix):
-						// Apply type modifications
-						modifiedLine := line
-						if strings.HasSuffix(line, infoTypeString) {
-							modifiedLine = line[:len(line)-len(infoTypeString)] + gaugeTypeString
-						} else if strings.HasSuffix(line, stateSetTypeString) {
-							modifiedLine = line[:len(line)-len(stateSetTypeString)] + gaugeTypeString
-						}
-						sb.WriteString(modifiedLine)
-						sb.WriteByte('\n')
-					default:
-						sb.WriteString(line)
-						sb.WriteByte('\n')
-					}
+				sb.Grow(len(header) + len(gaugeTypeString) - len(infoTypeString) + 1)
+				sb.WriteString(header[:typeIdx])
+				sb.WriteString(newTypeLine)
+				
+				// Add everything after the TYPE line (including newline)
+				afterTypeIdx := typeIdx + lineEnd
+				if afterTypeIdx < len(header) {
+					sb.WriteString(header[afterTypeIdx:])
+				}
+				
+				// Ensure trailing newline
+				if sb.Len() > 0 && header[len(header)-1] != '\n' {
+					sb.WriteByte('\n')
 				}
 
 				writer.stores[0].headers[i] = sb.String()
