@@ -30,6 +30,10 @@ import (
 const (
 	helpPrefix = "# HELP "
 	typePrefix = "# TYPE "
+
+	// Bitmask flags for tracking seen headers (optimization: single map instead of two)
+	seenHelpFlag uint8 = 1 << 0
+	seenTypeFlag uint8 = 1 << 1
 )
 
 var (
@@ -188,14 +192,14 @@ func SanitizeHeaders(contentType expfmt.Format, writers MetricsWriterList) Metri
 	isTextPlain := contentType.FormatType() == expfmt.TypeTextPlain
 
 	// Deduplicate by metric name across all writers to handle non-consecutive duplicates during CRS reload.
+	// Use single map with bitmask flags instead of two separate maps for better cache locality
 	capHint := 0
 	for _, w := range clonedWriters {
 		if len(w.stores) > 0 {
 			capHint += len(w.stores[0].headers)
 		}
 	}
-	seenHELP := make(map[string]struct{}, capHint)
-	seenTYPE := make(map[string]struct{}, capHint)
+	seen := make(map[string]uint8, capHint)
 	for _, writer := range clonedWriters {
 		if len(writer.stores) > 0 {
 			for i := 0; i < len(writer.stores[0].headers); i++ {
@@ -213,19 +217,17 @@ func SanitizeHeaders(contentType expfmt.Format, writers MetricsWriterList) Metri
 					continue
 				}
 
-				// Check for duplicate HELP
-				if _, seen := seenHELP[metricName]; seen {
+				// Check for duplicates using bitmask flags
+				flags := seen[metricName]
+				
+				// If both HELP and TYPE already seen, this is a duplicate
+				if flags&seenHelpFlag != 0 && flags&seenTypeFlag != 0 {
 					writer.stores[0].headers[i] = ""
 					continue
 				}
-				seenHELP[metricName] = struct{}{}
-
-				// Check for duplicate TYPE
-				if _, seen := seenTYPE[metricName]; seen {
-					writer.stores[0].headers[i] = ""
-					continue
-				}
-				seenTYPE[metricName] = struct{}{}
+				
+				// Mark as seen (set both flags)
+				seen[metricName] = flags | seenHelpFlag | seenTypeFlag
 
 				// Check if TYPE line needs modification (only for text plain format)
 				if isTextPlain {
