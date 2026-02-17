@@ -289,18 +289,32 @@ func SanitizeHeaders(contentType expfmt.Format, writers MetricsWriterList) Metri
 				// 3. Everything after TYPE line
 				sb := stringBuilderPool.Get().(*strings.Builder)
 				sb.Reset()
-				sb.Grow(len(header) + len(gaugeTypeString) - len(infoTypeString) + 1)
+				
+				// Calculate exact size needed for optimal allocation
+				beforeLen := typeIdx
+				afterLen := 0
+				afterTypeIdx := typeIdx + lineEnd
+				if afterTypeIdx < len(header) {
+					afterLen = len(header) - afterTypeIdx
+				}
+				needsTrailingNewline := len(header) == 0 || header[len(header)-1] != '\n'
+				
+				exactSize := beforeLen + len(newTypeLine) + afterLen
+				if needsTrailingNewline {
+					exactSize++
+				}
+				
+				sb.Grow(exactSize)
 				sb.WriteString(header[:typeIdx])
 				sb.WriteString(newTypeLine)
 				
 				// Add everything after the TYPE line (including newline)
-				afterTypeIdx := typeIdx + lineEnd
 				if afterTypeIdx < len(header) {
 					sb.WriteString(header[afterTypeIdx:])
 				}
 				
 				// Ensure trailing newline
-				if sb.Len() > 0 && header[len(header)-1] != '\n' {
+				if needsTrailingNewline {
 					sb.WriteByte('\n')
 				}
 
