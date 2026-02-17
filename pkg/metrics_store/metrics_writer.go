@@ -65,23 +65,17 @@ type MetricsWriter struct {
 }
 
 func metricNameFromHeaderLine(line, prefix string) (string, bool) {
-	if !strings.HasPrefix(line, prefix) {
+	rest, found := strings.CutPrefix(line, prefix)
+	if !found || rest == "" {
 		return "", false
 	}
 
-	rest := line[len(prefix):]
-	if rest == "" {
+	// Extract metric name (first token before space)
+	name, _, _ := strings.Cut(rest, " ")
+	if name == "" {
 		return "", false
 	}
-
-	spaceIdx := strings.IndexByte(rest, ' ')
-	if spaceIdx == -1 {
-		return rest, true
-	}
-	if spaceIdx == 0 {
-		return "", false
-	}
-	return rest[:spaceIdx], true
+	return name, true
 }
 
 // extractMetricNameFromHeader extracts the metric name from a header string.
@@ -98,24 +92,14 @@ func extractMetricNameFromHeader(header string) string {
 		return ""
 	}
 
-	// Find the metric name (first token after "# HELP ")
-	spaceIdx := strings.IndexByte(rest, ' ')
-	nlIdx := strings.IndexByte(rest, '\n')
-
-	if spaceIdx == -1 && nlIdx == -1 {
-		return rest
+	// Find first space or newline - manual scan is faster than strings.Cut
+	for i := 0; i < len(rest); i++ {
+		if rest[i] == ' ' || rest[i] == '\n' {
+			return rest[:i]
+		}
 	}
-
-	endIdx := spaceIdx
-	if spaceIdx == -1 || (nlIdx != -1 && nlIdx < spaceIdx) {
-		endIdx = nlIdx
-	}
-
-	if endIdx == 0 {
-		return ""
-	}
-
-	return rest[:endIdx]
+	
+	return rest
 }
 
 // NewMetricsWriter creates a new MetricsWriter.
@@ -219,13 +203,13 @@ func SanitizeHeaders(contentType expfmt.Format, writers MetricsWriterList) Metri
 
 				// Check for duplicates using bitmask flags
 				flags := seen[metricName]
-				
+
 				// If both HELP and TYPE already seen, this is a duplicate
 				if flags&seenHelpFlag != 0 && flags&seenTypeFlag != 0 {
 					writer.stores[0].headers[i] = ""
 					continue
 				}
-				
+
 				// Mark as seen (set both flags)
 				seen[metricName] = flags | seenHelpFlag | seenTypeFlag
 
@@ -255,7 +239,6 @@ func SanitizeHeaders(contentType expfmt.Format, writers MetricsWriterList) Metri
 				}
 
 				// Surgical replacement: only modify the TYPE line
-				// This avoids parsing every line and allocating a StringBuilder for each
 				typeIdx := strings.Index(header, typePrefix)
 				if typeIdx == -1 {
 					// Should not happen if needsModification is true, but be defensive
@@ -264,17 +247,19 @@ func SanitizeHeaders(contentType expfmt.Format, writers MetricsWriterList) Metri
 
 				// Find the end of the TYPE line
 				lineEnd := strings.IndexByte(header[typeIdx:], '\n')
+				afterTypeIdx := typeIdx + lineEnd
 				if lineEnd == -1 {
 					lineEnd = len(header) - typeIdx
+					afterTypeIdx = len(header)
 				}
 				typeLine := header[typeIdx : typeIdx+lineEnd]
 
-				// Determine the replacement
-				var newTypeLine string
+				// Determine the replacement type
+				var oldTypeLen int
 				if strings.HasSuffix(typeLine, infoTypeString) {
-					newTypeLine = typeLine[:len(typeLine)-len(infoTypeString)] + gaugeTypeString
+					oldTypeLen = len(infoTypeString)
 				} else if strings.HasSuffix(typeLine, stateSetTypeString) {
-					newTypeLine = typeLine[:len(typeLine)-len(stateSetTypeString)] + gaugeTypeString
+					oldTypeLen = len(stateSetTypeString)
 				} else {
 					// No modification needed after all
 					if !strings.HasSuffix(header, "\n") {
@@ -285,30 +270,35 @@ func SanitizeHeaders(contentType expfmt.Format, writers MetricsWriterList) Metri
 
 				// Build the new header by concatenating three parts:
 				// 1. Everything before TYPE line
-				// 2. Modified TYPE line
+				// 2. Modified TYPE line (built with StringBuilder to avoid intermediate allocations)
 				// 3. Everything after TYPE line
 				sb := stringBuilderPool.Get().(*strings.Builder)
 				sb.Reset()
-				
+
 				// Calculate exact size needed for optimal allocation
+				needsTrailingNewline := len(header) == 0 || header[len(header)-1] != '\n'
 				beforeLen := typeIdx
+				typeLineLen := len(typeLine) - oldTypeLen + len(gaugeTypeString)
 				afterLen := 0
-				afterTypeIdx := typeIdx + lineEnd
 				if afterTypeIdx < len(header) {
 					afterLen = len(header) - afterTypeIdx
 				}
-				needsTrailingNewline := len(header) == 0 || header[len(header)-1] != '\n'
 				
-				exactSize := beforeLen + len(newTypeLine) + afterLen
+				exactSize := beforeLen + typeLineLen + afterLen
 				if needsTrailingNewline {
 					exactSize++
 				}
-				
+
 				sb.Grow(exactSize)
-				sb.WriteString(header[:typeIdx])
-				sb.WriteString(newTypeLine)
 				
-				// Add everything after the TYPE line (including newline)
+				// Write: everything before TYPE line
+				sb.WriteString(header[:typeIdx])
+				
+				// Write: modified TYPE line (use StringBuilder to avoid allocations)
+				sb.WriteString(typeLine[:len(typeLine)-oldTypeLen])
+				sb.WriteString(gaugeTypeString)
+
+				// Write: everything after the TYPE line
 				if afterTypeIdx < len(header) {
 					sb.WriteString(header[afterTypeIdx:])
 				}
