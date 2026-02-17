@@ -72,6 +72,40 @@ func metricNameFromHeaderLine(line, prefix string) (string, bool) {
 	return rest[:spaceIdx], true
 }
 
+// extractMetricNameFromHeader extracts the metric name from a header string.
+// Headers are expected to start with "# HELP <metric_name> ..." or "# TYPE <metric_name> ...".
+// This function extracts the metric name once instead of parsing both HELP and TYPE lines.
+func extractMetricNameFromHeader(header string) string {
+	// Headers should start with HELP line
+	if !strings.HasPrefix(header, helpPrefix) {
+		return ""
+	}
+
+	rest := header[len(helpPrefix):]
+	if rest == "" {
+		return ""
+	}
+
+	// Find the metric name (first token after "# HELP ")
+	spaceIdx := strings.IndexByte(rest, ' ')
+	nlIdx := strings.IndexByte(rest, '\n')
+
+	if spaceIdx == -1 && nlIdx == -1 {
+		return rest
+	}
+
+	endIdx := spaceIdx
+	if spaceIdx == -1 || (nlIdx != -1 && nlIdx < spaceIdx) {
+		endIdx = nlIdx
+	}
+
+	if endIdx == 0 {
+		return ""
+	}
+
+	return rest[:endIdx]
+}
+
 // NewMetricsWriter creates a new MetricsWriter.
 func NewMetricsWriter(resourceName string, stores ...*MetricsStore) *MetricsWriter {
 	return &MetricsWriter{
@@ -163,73 +197,42 @@ func SanitizeHeaders(contentType expfmt.Format, writers MetricsWriterList) Metri
 				}
 
 				// First pass: check if we need to modify this header
-				shouldRemove := false
 				needsModification := false
-				var helpMetricName, typeMetricName string
 
-				rest := header
-				for rest != "" {
-					var line string
-					idx := strings.IndexByte(rest, '\n')
-					if idx != -1 {
-						line = rest[:idx]
-						rest = rest[idx+1:]
-					} else {
-						line = rest
-						rest = ""
-					}
-
-					if line == "" && rest == "" {
-						break
-					}
-
-					switch {
-					case strings.HasPrefix(line, helpPrefix):
-						metricName, ok := metricNameFromHeaderLine(line, helpPrefix)
-						if ok {
-							helpMetricName = metricName
-							if _, seen := seenHELP[metricName]; seen {
-								shouldRemove = true
-								break
-							}
-						}
-
-					case strings.HasPrefix(line, typePrefix):
-						if shouldRemove {
-							break
-						}
-						metricName, ok := metricNameFromHeaderLine(line, typePrefix)
-						if ok {
-							typeMetricName = metricName
-							// Check if this type line needs modification
-							if isTextPlain {
-								if strings.HasSuffix(line, infoTypeString) || strings.HasSuffix(line, stateSetTypeString) {
-									needsModification = true
-								}
-							}
-							if _, seen := seenTYPE[metricName]; seen {
-								shouldRemove = true
-								break
-							}
-						}
-					}
-					if shouldRemove {
-						break
-					}
-				}
-
-				// Handle removal case
-				if shouldRemove {
-					writer.stores[0].headers[i] = ""
+				// Extract metric name once from the header
+				metricName := extractMetricNameFromHeader(header)
+				if metricName == "" {
 					continue
 				}
 
-				// Mark as seen
-				if helpMetricName != "" {
-					seenHELP[helpMetricName] = struct{}{}
+				// Check for duplicate HELP
+				if _, seen := seenHELP[metricName]; seen {
+					writer.stores[0].headers[i] = ""
+					continue
 				}
-				if typeMetricName != "" {
-					seenTYPE[typeMetricName] = struct{}{}
+				seenHELP[metricName] = struct{}{}
+
+				// Check for duplicate TYPE
+				if _, seen := seenTYPE[metricName]; seen {
+					writer.stores[0].headers[i] = ""
+					continue
+				}
+				seenTYPE[metricName] = struct{}{}
+
+				// Check if TYPE line needs modification (only for text plain format)
+				if isTextPlain {
+					// Find TYPE line to check if it needs modification
+					typeIdx := strings.Index(header, typePrefix)
+					if typeIdx != -1 {
+						lineEnd := strings.IndexByte(header[typeIdx:], '\n')
+						if lineEnd == -1 {
+							lineEnd = len(header) - typeIdx
+						}
+						typeLine := header[typeIdx : typeIdx+lineEnd]
+						if strings.HasSuffix(typeLine, infoTypeString) || strings.HasSuffix(typeLine, stateSetTypeString) {
+							needsModification = true
+						}
+					}
 				}
 
 				// Fast path: no modification needed
