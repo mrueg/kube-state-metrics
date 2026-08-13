@@ -327,6 +327,11 @@ func RunKubeStateMetrics(ctx context.Context, opts *options.Options) error {
 		storeBuilder,
 		opts.EnableGZIPEncoding,
 	)
+	// Include kube-state-metrics' own telemetry in the OTLP export: a push-only
+	// deployment never scrapes the telemetry port, so this is otherwise the one
+	// signal it cannot see.
+	m.SetSelfMetricsGatherer(ksmMetricsRegistry)
+
 	// The stores, and the CRD discovery feeding them, are not stopped with
 	// ctx but only once the servers have drained, so that scrapes still in
 	// flight at shutdown are served from live stores.

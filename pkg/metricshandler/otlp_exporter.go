@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"strings"
 	"time"
 
@@ -69,6 +70,9 @@ func validateOTLPOptions(opts *options.Options) error {
 	if opts.OTLPInterval <= 0 {
 		return fmt.Errorf("--otlp-interval must be greater than 0, got %s", opts.OTLPInterval)
 	}
+	if opts.OTLPCompression != "" && opts.OTLPCompression != "gzip" && opts.OTLPCompression != "none" {
+		return fmt.Errorf("--otlp-compression must be either %q or %q, got %q", "gzip", "none", opts.OTLPCompression)
+	}
 	return nil
 }
 
@@ -90,7 +94,7 @@ func (m *MetricsHandler) RunOTLPExport(ctx context.Context) error {
 		return nil
 	}
 
-	res := otlpResource()
+	res := otlpResource(m.opts)
 
 	// Cumulative sums are only interpretable against the point in time the
 	// counters started from. Every export reports the same start, which is when
@@ -125,7 +129,7 @@ func (m *MetricsHandler) RunOTLPExport(ctx context.Context) error {
 // resource.Default() falls back to "unknown_service:<binary>" when nothing names
 // the service, and that fallback should lose to our name but an explicit
 // setting should win.
-func otlpResource() *resource.Resource {
+func otlpResource(opts *options.Options) *resource.Resource {
 	base := resource.Default()
 
 	var attrs []attribute.KeyValue
@@ -134,6 +138,15 @@ func otlpResource() *resource.Resource {
 	}
 	if !hasAttribute(base, "service.version") {
 		attrs = append(attrs, attribute.String("service.version", version.Version))
+	}
+	// Without an instance id every replica reports the same resource identity.
+	// Prometheus derives the instance label from it, so a sharded deployment
+	// would have all shards write the same target_info series, interleaving
+	// samples from N writers into one timeline.
+	if !hasAttribute(base, "service.instance.id") {
+		if id := instanceID(opts); id != "" {
+			attrs = append(attrs, attribute.String("service.instance.id", id))
+		}
 	}
 	if len(attrs) == 0 {
 		return base
@@ -145,6 +158,20 @@ func otlpResource() *resource.Resource {
 		return base
 	}
 	return merged
+}
+
+// instanceID identifies this replica. --pod is set from the downward API for
+// autosharding; outside that, the hostname is the pod name in a cluster.
+func instanceID(opts *options.Options) string {
+	if opts != nil && opts.Pod != "" {
+		return opts.Pod
+	}
+	host, err := os.Hostname()
+	if err != nil {
+		klog.ErrorS(err, "Failed to determine the hostname for service.instance.id")
+		return ""
+	}
+	return host
 }
 
 func hasAttribute(res *resource.Resource, key string) bool {
@@ -222,6 +249,9 @@ func newOTLPExporter(ctx context.Context, opts *options.Options) (metric.Exporte
 		if opts.OTLPInsecure {
 			httpOpts = append(httpOpts, otlpmetrichttp.WithInsecure())
 		}
+		if opts.OTLPCompression == "gzip" {
+			httpOpts = append(httpOpts, otlpmetrichttp.WithCompression(otlpmetrichttp.GzipCompression))
+		}
 		return otlpmetrichttp.New(ctxTimeout, httpOpts...)
 	}
 
@@ -230,6 +260,9 @@ func newOTLPExporter(ctx context.Context, opts *options.Options) (metric.Exporte
 	}
 	if opts.OTLPInsecure {
 		grpcOpts = append(grpcOpts, otlpmetricgrpc.WithInsecure())
+	}
+	if opts.OTLPCompression == "gzip" {
+		grpcOpts = append(grpcOpts, otlpmetricgrpc.WithCompressor("gzip"))
 	}
 	return otlpmetricgrpc.New(ctxTimeout, grpcOpts...)
 }
@@ -263,6 +296,7 @@ func (m *MetricsHandler) gatherOTLPMetrics(res *resource.Resource, startTime, no
 	}
 
 	metrics := agg.metrics()
+	metrics = append(metrics, selfMetrics(m.selfGatherer, startTime, now)...)
 	if len(metrics) == 0 {
 		return nil
 	}
@@ -331,6 +365,12 @@ func (a *otlpAggregator) metrics() []metricdata.Metrics {
 	out := make([]metricdata.Metrics, 0, len(a.order))
 	for _, name := range a.order {
 		af := a.byName[name]
+		// Unit is deliberately left empty. kube-state-metrics has no
+		// family-level unit metadata -- units are encoded in the metric name
+		// (_seconds, _bytes) and, for resource metrics, in a "unit" label --
+		// and receivers that append a unit suffix during translation would then
+		// risk producing kube_pod_start_time_seconds_seconds. Populating this
+		// correctly needs a Unit on the family generator first.
 		md := metricdata.Metrics{
 			Name:        af.name,
 			Description: af.description,

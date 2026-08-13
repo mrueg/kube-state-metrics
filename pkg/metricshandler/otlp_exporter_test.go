@@ -19,6 +19,7 @@ package metricshandler
 import (
 	"context"
 	"errors"
+	"os"
 	"strings"
 	"testing"
 	"time"
@@ -169,6 +170,13 @@ func TestValidateOTLPOptions(t *testing.T) {
 			mutate:  func(o *options.Options) { o.OTLPInterval = -time.Second },
 			wantErr: "--otlp-interval must be greater than 0",
 		},
+		{name: "gzip compression", mutate: func(o *options.Options) { o.OTLPCompression = "gzip" }},
+		{name: "no compression", mutate: func(o *options.Options) { o.OTLPCompression = "none" }},
+		{
+			name:    "unknown compression",
+			mutate:  func(o *options.Options) { o.OTLPCompression = "brotli" },
+			wantErr: "--otlp-compression must be either",
+		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			o := valid()
@@ -206,13 +214,34 @@ func TestOTLPResourceRespectsEnvironment(t *testing.T) {
 	}
 
 	t.Run("defaults to our own service name", func(t *testing.T) {
-		res := otlpResource()
+		res := otlpResource(&options.Options{})
 		got, ok := attrOf(res, "service.name")
 		if !ok || got != "kube-state-metrics" {
 			t.Errorf("service.name = %q (present=%v), want %q", got, ok, "kube-state-metrics")
 		}
 		if _, ok := attrOf(res, "service.version"); !ok {
 			t.Error("service.version missing")
+		}
+	})
+
+	// Every shard would otherwise report the same resource identity, so
+	// Prometheus would fold N writers into one target_info series.
+	t.Run("identifies the replica", func(t *testing.T) {
+		res := otlpResource(&options.Options{Pod: "kube-state-metrics-2"})
+		got, ok := attrOf(res, "service.instance.id")
+		if !ok || got != "kube-state-metrics-2" {
+			t.Errorf("service.instance.id = %q (present=%v), want the pod name", got, ok)
+		}
+	})
+
+	t.Run("falls back to the hostname", func(t *testing.T) {
+		res := otlpResource(&options.Options{})
+		host, err := os.Hostname()
+		if err != nil {
+			t.Skip("hostname unavailable")
+		}
+		if got, ok := attrOf(res, "service.instance.id"); !ok || got != host {
+			t.Errorf("service.instance.id = %q (present=%v), want the hostname %q", got, ok, host)
 		}
 	})
 
