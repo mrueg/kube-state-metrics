@@ -32,12 +32,19 @@ kube-state-metrics \
 
 **Export to a remote HTTP endpoint:**
 
+`--otlp-endpoint` takes a host and optional port only — no scheme and no path.
+TLS is used unless `--otlp-insecure` is set, and the path defaults to
+`/v1/metrics`; override it with `--otlp-url-path`.
+
 ```bash
 kube-state-metrics \
   --enable-otlp-export \
-  --otlp-endpoint=https://otel-collector.example.com:4318/v1/metrics \
+  --otlp-endpoint=otel-collector.example.com:4318 \
   --otlp-protocol=http
 ```
+
+Passing a full URL such as `https://otel-collector.example.com:4318/v1/metrics`
+fails at startup with an "invalid port" parse error.
 
 ## Metric conversion
 
