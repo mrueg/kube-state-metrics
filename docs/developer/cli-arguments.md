@@ -52,6 +52,7 @@ Flags:
       --custom-resource-state-config-file string             Path to a Custom Resource State Metrics config file (experimental)
       --custom-resource-state-only                           Only provide Custom Resource State metrics (experimental)
       --enable-gzip-encoding                                 Gzip responses when requested by clients via 'Accept-Encoding: gzip' header.
+      --enable-otlp-export                                   Enable export of metrics via OTLP. (experimental)
   -h, --help                                                 Print Help text
       --host string                                          Host to expose metrics on. (default "::")
       --kubeconfig string                                    Absolute path to the kubeconfig file
@@ -71,8 +72,13 @@ Flags:
       --node string                                          Name of the node that contains the kube-state-metrics pod. Most likely it should be passed via the downward API. This is used for daemonset sharding. Only available for resources (pod metrics) that support spec.nodeName fieldSelector. This is experimental.
       --object-limit int                                     The maximum number of objects per resource that kube-state-metrics keeps from the API Server. (experimental)
       --one_output                                           If true, only write logs to their native severity level (vs also writing to each lower severity level; no effect when -logtostderr=true)
-      --pod string                                           Name of the pod that contains the kube-state-metrics container. When set, it is expected that --pod and --pod-namespace are both set. Most likely this should be passed via the downward API. This is used for auto-detecting sharding. If set, this has preference over statically configured sharding.
-      --pod-namespace string                                 Name of the namespace of the pod specified by --pod. When set, it is expected that --pod and --pod-namespace are both set. Most likely this should be passed via the downward API. This is used for auto-detecting sharding. If set, this has preference over statically configured sharding.
+      --otlp-endpoint string                                 The endpoint for OTLP export. (experimental)
+      --otlp-insecure                                        Enable insecure OTLP connection. (experimental)
+      --otlp-interval duration                               The interval for OTLP export. (experimental) (default 1m0s)
+      --otlp-protocol string                                 The protocol for OTLP export (grpc or http). (experimental) (default "grpc")
+      --otlp-url-path string                                 The URL path for OTLP HTTP export. (experimental)
+      --pod string                                           Name of the pod that contains the kube-state-metrics container. When set, it is expected that --pod and --pod-namespace are both set. Most likely this should be passed via the downward API. This is used for auto-detecting sharding. If set, this has preference over statically configured sharding. This is experimental, it may be removed without notice.
+      --pod-namespace string                                 Name of the namespace of the pod specified by --pod. When set, it is expected that --pod and --pod-namespace are both set. Most likely this should be passed via the downward API. This is used for auto-detecting sharding. If set, this has preference over statically configured sharding. This is experimental, it may be removed without notice.
       --port int                                             Port to expose metrics on. (default 8080)
       --resources string                                     Comma-separated list of resources to be enabled. Defaults to "certificatesigningrequests,configmaps,cronjobs,daemonsets,deployments,endpointslices,horizontalpodautoscalers,ingresses,jobs,leases,limitranges,mutatingadmissionpolicies,mutatingadmissionpolicybindings,mutatingwebhookconfigurations,namespaces,networkpolicies,nodes,persistentvolumeclaims,persistentvolumes,poddisruptionbudgets,pods,replicasets,replicationcontrollers,resourcequotas,secrets,services,statefulsets,storageclasses,validatingadmissionpolicies,validatingadmissionpolicybindings,validatingwebhookconfigurations,volumeattachments"
       --server-idle-timeout duration                         The maximum amount of time to wait for the next request when keep-alives are enabled. Align with the idletimeout of your scrape clients. (default 5m0s)
