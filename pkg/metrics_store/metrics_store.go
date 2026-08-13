@@ -17,6 +17,7 @@ limitations under the License.
 package metricsstore
 
 import (
+	"strings"
 	"sync"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -57,6 +58,14 @@ type MetricsStore struct {
 	headersOpenMetrics []string
 	headersTextPlain   []string
 	metricNames        []string
+	// metricHelp holds the help text declared by each header, indexed the same
+	// way as headers, so exporters that carry a description can recover it
+	// without re-parsing the header on every collection.
+	metricHelp []string
+
+	// retainFamilies keeps the generated families for Export in addition to
+	// their rendered bytes. Only the OTLP exporter needs them, see Add.
+	retainFamilies bool
 
 	// objectLimit is the maximum number of objects kept in the store, 0 means
 	// no limit. objectCount tracks the number of objects currently stored and
@@ -85,16 +94,27 @@ func WithObjectLimit(limit int64, onDropped func()) Option {
 	}
 }
 
+// WithFamilyRetention makes the store keep the generated metric families in
+// addition to their rendered bytes, so they can be read back via Export. It
+// costs memory proportional to the whole object graph, so only enable it when
+// something consumes Export.
+func WithFamilyRetention(retain bool) Option {
+	return func(s *MetricsStore) {
+		s.retainFamilies = retain
+	}
+}
+
 // NewMetricsStore returns a new MetricsStore
 func NewMetricsStore(headers []string, generateFunc func(any) []metric.FamilyInterface, opts ...Option) *MetricsStore {
 	rv := ""
-	headersOpenMetrics, headersTextPlain, metricNames := precomputeHeaders(headers)
+	headersOpenMetrics, headersTextPlain, metricNames, metricHelp := precomputeHeaders(headers)
 	s := &MetricsStore{
 		generateMetricsFunc:   generateFunc,
 		headers:               headers,
 		headersOpenMetrics:    headersOpenMetrics,
 		headersTextPlain:      headersTextPlain,
 		metricNames:           metricNames,
+		metricHelp:            metricHelp,
 		metrics:               &sync.Map{},
 		families:              &sync.Map{},
 		lastResourceVersion:   &rv,
@@ -110,18 +130,44 @@ func NewMetricsStore(headers []string, generateFunc func(any) []metric.FamilyInt
 // rewritten header for both exposition formats plus the metric name it declares.
 // SanitizeHeaders runs on every scrape and would otherwise redo this work per
 // header, per store, per request.
-func precomputeHeaders(headers []string) (headersOpenMetrics, headersTextPlain, metricNames []string) {
+func precomputeHeaders(headers []string) (headersOpenMetrics, headersTextPlain, metricNames, metricHelp []string) {
 	headersOpenMetrics = make([]string, len(headers))
 	headersTextPlain = make([]string, len(headers))
 	metricNames = make([]string, len(headers))
+	metricHelp = make([]string, len(headers))
 	for i, h := range headers {
 		mName, rHeaderOM := parseHeaderStatic(h, false)
 		_, rHeaderText := parseHeaderStatic(h, true)
 		headersOpenMetrics[i] = rHeaderOM
 		headersTextPlain[i] = rHeaderText
 		metricNames[i] = mName
+		metricHelp[i] = helpFromHeader(h)
 	}
-	return headersOpenMetrics, headersTextPlain, metricNames
+	return headersOpenMetrics, headersTextPlain, metricNames, metricHelp
+}
+
+// FamilyHelp returns the help text of each metric family, indexed the same way
+// as the families returned by Export.
+func (s *MetricsStore) FamilyHelp() []string {
+	return s.metricHelp
+}
+
+// helpFromHeader returns the help text of a "# HELP <name> <help>" line, or the
+// empty string if the header does not declare one.
+func helpFromHeader(header string) string {
+	if !strings.HasPrefix(header, helpPrefix) {
+		return ""
+	}
+	rest := header[len(helpPrefix):]
+	sp := strings.IndexByte(rest, ' ')
+	if sp < 0 {
+		return ""
+	}
+	rest = rest[sp+1:]
+	if nl := strings.IndexByte(rest, '\n'); nl >= 0 {
+		rest = rest[:nl]
+	}
+	return rest
 }
 
 // Implementing k8s.io/client-go/tools/cache.Store interface
@@ -135,7 +181,9 @@ func (s *MetricsStore) Add(obj any) error {
 	// bookkeeping is skipped here.
 	if r, ok := obj.(*renderedObject); ok {
 		s.metrics.Store(r.uid, r.families)
-		s.families.Store(r.uid, r.generated)
+		if s.retainFamilies {
+			s.families.Store(r.uid, r.generated)
+		}
 		return nil
 	}
 
@@ -164,7 +212,13 @@ func (s *MetricsStore) Add(obj any) error {
 	families := s.generateMetricsFunc(obj)
 
 	s.metrics.Store(o.GetUID(), renderFamilies(families))
-	s.families.Store(o.GetUID(), families)
+	// Keeping the families alive retains the whole generated object graph,
+	// every Metric with its label slices, for as long as the object is in the
+	// store, on top of the rendered bytes that WriteAll serves. Only Export
+	// needs them.
+	if s.retainFamilies {
+		s.families.Store(o.GetUID(), families)
+	}
 
 	return nil
 }
@@ -344,19 +398,23 @@ func (s *MetricsStore) Transformer() cache.TransformFunc {
 			return obj, nil
 		}
 		generated := s.generateMetricsFunc(obj)
-		return &renderedObject{
-			uid:       o.GetUID(),
-			families:  renderFamilies(generated),
-			generated: generated,
-		}, nil
+		r := &renderedObject{
+			uid:      o.GetUID(),
+			families: renderFamilies(generated),
+		}
+		if s.retainFamilies {
+			r.generated = generated
+		}
+		return r, nil
 	}
 }
 
 // renderedObject stands in for an object in the reflector's temporary store and
 // holds the metrics already generated from it.
 type renderedObject struct {
-	uid       types.UID
-	families  [][]byte
+	uid      types.UID
+	families [][]byte
+	// generated holds the families for Export, if the store retains them.
 	generated []metric.FamilyInterface
 }
 
@@ -378,8 +436,15 @@ func (s *MetricsStore) setLastResourceVersion(rv string) {
 	*s.lastResourceVersion = rv
 }
 
-// Export exports the metrics in the store.
+// Export returns the metric families of every object in the store, one slice
+// per object. It returns nothing unless the store was built with
+// WithFamilyRetention.
+//
+// The returned families alias live store state and must not be mutated.
 func (s *MetricsStore) Export() [][]metric.FamilyInterface {
+	if !s.retainFamilies {
+		return nil
+	}
 	var allFamilies [][]metric.FamilyInterface
 	s.families.Range(func(_, value any) bool {
 		allFamilies = append(allFamilies, value.([]metric.FamilyInterface))

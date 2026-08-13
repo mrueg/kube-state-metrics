@@ -90,6 +90,10 @@ type Builder struct {
 	shard              int32
 	useAPIServerCache  bool
 	objectLimit        int64
+	// retainMetricFamilies makes the built stores keep the generated families
+	// so MetricsStore.Export can read them back. Only the OTLP exporter needs
+	// this; it costs memory per stored object.
+	retainMetricFamilies bool
 
 	GetGVKStopChan func(gvk string) chan struct{}
 }
@@ -212,6 +216,12 @@ func (b *Builder) WithUsingAPIServerCache(u bool) {
 // This is to protect kube-state-metrics from running out of memory if the APIServer has a lot of objects.
 func (b *Builder) WithObjectLimit(l int64) {
 	b.objectLimit = l
+}
+
+// WithRetainMetricFamilies makes the built stores retain their generated metric
+// families so they can be read back via MetricsStore.Export.
+func (b *Builder) WithRetainMetricFamilies(retain bool) {
+	b.retainMetricFamilies = retain
 }
 
 // WithFamilyGeneratorFilter configures the family generator filter which decides which
@@ -655,6 +665,7 @@ func (b *Builder) buildStores(
 			familyHeaders,
 			composedMetricGenFuncs,
 			b.objectLimitOption(expectedType, objectLimit),
+			b.familyRetentionOption(),
 		)
 		if b.fieldSelectorFilter != "" {
 			klog.InfoS("FieldSelector is used", "fieldSelector", b.fieldSelectorFilter)
@@ -670,6 +681,7 @@ func (b *Builder) buildStores(
 			familyHeaders,
 			composedMetricGenFuncs,
 			b.objectLimitOption(expectedType, objectLimit),
+			b.familyRetentionOption(),
 		)
 		if b.fieldSelectorFilter != "" {
 			klog.InfoS("FieldSelector is used", "fieldSelector", b.fieldSelectorFilter)
@@ -715,6 +727,7 @@ func (b *Builder) buildCustomResourceStores(resourceName string,
 			familyHeaders,
 			composedMetricGenFuncs,
 			b.objectLimitOption(expectedType, objectLimit),
+			b.familyRetentionOption(),
 		)
 		if b.fieldSelectorFilter != "" {
 			klog.InfoS("FieldSelector is used", "fieldSelector", b.fieldSelectorFilter)
@@ -730,6 +743,7 @@ func (b *Builder) buildCustomResourceStores(resourceName string,
 			familyHeaders,
 			composedMetricGenFuncs,
 			b.objectLimitOption(expectedType, objectLimit),
+			b.familyRetentionOption(),
 		)
 		klog.InfoS("FieldSelector is used", "fieldSelector", b.fieldSelectorFilter)
 		listWatcher := listWatchFunc(customResourceClient, ns, b.fieldSelectorFilter)
@@ -798,4 +812,10 @@ func cacheStoresToMetricStores(cStores []cache.Store) []*metricsstore.MetricsSto
 	}
 
 	return mStores
+}
+
+// familyRetentionOption makes the built stores retain the generated metric
+// families for MetricsStore.Export when the OTLP exporter reads them.
+func (b *Builder) familyRetentionOption() metricsstore.Option {
+	return metricsstore.WithFamilyRetention(b.retainMetricFamilies)
 }

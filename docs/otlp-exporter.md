@@ -15,7 +15,8 @@ The OTLP exporter is disabled by default. You can enable and configure it using 
 | `--otlp-endpoint` | The endpoint of the OTLP receiver. Required if export is enabled. | `""` |
 | `--otlp-protocol` | The protocol to use for export. Supported values: `grpc`, `http`. | `grpc` |
 | `--otlp-insecure` | Allow insecure connections (no TLS) to the OTLP receiver. | `false` |
-| `--otlp-interval` | The interval at which metrics are exported. | `1m0s` |
+| `--otlp-interval` | The interval at which metrics are exported. Must be greater than 0. | `1m0s` |
+| `--otlp-url-path` | Override the URL path of the OTLP HTTP receiver. Ignored for `grpc`. | `""` |
 
 ### Examples
 
@@ -47,4 +48,17 @@ kube-state-metrics \
 *   **Info** -> OTLP Gauge (value 1, labels as attributes)
 *   **StateSet** -> OTLP Gauge (value 0 or 1 per series)
 
-Labels are converted to OTLP Attributes.
+Labels are converted to OTLP Attributes, and each metric's `# HELP` text is
+carried across as the OTLP metric description.
+
+All data points of a metric are folded into a single OTLP metric, regardless of
+how many Kubernetes objects contributed to it. Cumulative sums report the time
+the exporter started as their start timestamp.
+
+Exported batches carry the resource attributes `service.name=kube-state-metrics`
+and `service.version`.
+
+> [!NOTE]
+> Enabling the exporter makes each store retain its generated metric families in
+> addition to their rendered exposition bytes, which increases memory use per
+> watched object. Nothing is retained while `--enable-otlp-export` is `false`.
