@@ -33,6 +33,10 @@ spec:
         image: prom/prometheus:v3.9.1
         args:
           - "--config.file=/etc/prometheus/prometheus.yml"
+          # Prometheus receives OTLP over HTTP only, on the web port, at
+          # /api/v1/otlp/v1/metrics. The 4317/4318 ports below are declared for
+          # convention; nothing listens on them. Covering --otlp-protocol=grpc
+          # would need an OpenTelemetry Collector in front.
           - "--web.enable-otlp-receiver"
         ports:
         - containerPort: 9090

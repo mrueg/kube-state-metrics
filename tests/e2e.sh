@@ -165,89 +165,113 @@ function test_daemonset() {
 function test_otlp() {
     echo "Starting OTLP tests..."
 
-    # Helper to wait for Prometheus
+    PF_PID=""
+
+    # Prometheus serves its OTLP receiver on the web port, under
+    # /api/v1/otlp/v1/metrics. --otlp-endpoint takes a host and optional port
+    # only -- a path there fails exporter construction with "invalid port" --
+    # so the path goes to --otlp-url-path.
+    OTLP_ENDPOINT="prometheus.default.svc:9090"
+    OTLP_URL_PATH="/api/v1/otlp/v1/metrics"
+
+    function stop_prometheus_port_forward() {
+        if [[ -n "${PF_PID}" ]]; then
+            kill "${PF_PID}" > /dev/null 2>&1 || true
+            PF_PID=""
+        fi
+    }
+
     function wait_for_prometheus() {
         echo "Waiting for Prometheus to be queryable..."
         for i in {1..60}; do
-            if ! curl -s "http://localhost:9090/-/ready" > /dev/null 2>&1; then
-                 # Try to start/restart port-forward
-                 if [[ -n "$PF_PID" ]]; then kill $PF_PID > /dev/null 2>&1 || true; fi
-                 kubectl port-forward svc/prometheus 9090:9090 > /dev/null 2>&1 &
-                 PF_PID=$!
-                 sleep 2
-            fi
-            
-            RESP=$(curl -s "http://localhost:9090/-/ready" || true)
-            echo "Prometheus response: $RESP"
-            if echo "$RESP" | grep -q "Prometheus.*Ready"; then
+            if curl -s "http://localhost:9090/-/ready" 2>/dev/null | grep -q "Ready"; then
                 echo "Prometheus is ready"
                 return 0
             fi
-            echo "Waiting for Prometheus port-forward... ($i)"
+            # Re-establish the port-forward: it exits when the pod restarts.
+            stop_prometheus_port_forward
+            kubectl port-forward svc/prometheus 9090:9090 > /dev/null 2>&1 &
+            PF_PID=$!
+            echo "waiting for the Prometheus port-forward ($i)"
             sleep 2
         done
         echo "Prometheus failed to become ready"
         return 1
     }
 
-    # Deploy Prometheus with OTLP receiver
+    # Deploy Prometheus with its OTLP receiver enabled.
     kubectl apply -f ./tests/e2e/otlp/prometheus.yaml
-    kube_pod_up prometheus
-    
-    # Expose Prometheus port locally
-    echo "Starting port-forward to Prometheus..."
-    PF_PID=""
+    kubectl rollout status deployment/prometheus -n default --timeout=180s
     wait_for_prometheus
 
     # Apply all standard resources (RBAC, Service, etc.)
     kubectl apply -k ./examples/standard/
 
-    # Prepare a temp deployment file
-    cp ./examples/standard/deployment.yaml ./tests/e2e/otlp/deployment-temp.yaml
-
-    # --- Test 2: OTLP HTTP ---
-    echo "Test 2: OTLP HTTP"
-    
-    # Reset temp file
     cp ./examples/standard/deployment.yaml ./tests/e2e/otlp/deployment-temp.yaml
     sed -i "s|image: .*|image: ${KUBE_STATE_METRICS_IMAGE_NAME}:${KUBE_STATE_METRICS_IMAGE_TAG}|g" ./tests/e2e/otlp/deployment-temp.yaml
-    
-    # Inject OTLP HTTP args
-    sed -i '/image: /a \          args:\n            - --enable-otlp-export\n            - --otlp-endpoint=prometheus.default.svc:9090/api/v1/otlp/v1/metrics\n            - --otlp-protocol=http\n            - --otlp-insecure\n            - --otlp-interval=5s\n            - --metric-allowlist=kube_pod_info' ./tests/e2e/otlp/deployment-temp.yaml
-    
+    sed -i "/image: /a \\          args:\\n            - --enable-otlp-export\\n            - --otlp-endpoint=${OTLP_ENDPOINT}\\n            - --otlp-url-path=${OTLP_URL_PATH}\\n            - --otlp-protocol=http\\n            - --otlp-insecure\\n            - --otlp-interval=5s\\n            - --metric-allowlist=kube_pod_info" ./tests/e2e/otlp/deployment-temp.yaml
+
     kubectl apply -f ./tests/e2e/otlp/deployment-temp.yaml
-    # Wait for rollout to complete to ensure we are testing the new pod
-    kubectl rollout status deployment/kube-state-metrics -n kube-system
-    
+    # Wait for the rollout so we are testing the new pod, not the previous one.
+    kubectl rollout status deployment/kube-state-metrics -n kube-system --timeout=180s
+
     kube_state_metrics_up kube-state-metrics
 
-    # Wait for metrics to be pushed
-    echo "Waiting for metrics in Prometheus (HTTP)..."
+    echo "Waiting for metrics to arrive in Prometheus over OTLP/HTTP..."
     FOUND=false
     for i in {1..30}; do
-        # Query for kube_pod_info. Value should be present.
-        RESULT=$(curl -s -g 'http://localhost:9090/api/v1/query?query=kube_pod_info')
-        # Check if result contains metric name
-        if echo "$RESULT" | grep -q "kube_pod_info"; then
-             echo "Metric kube_pod_info found in Prometheus!"
-             FOUND=true
-             break
+        RESULT=$(curl -s -g 'http://localhost:9090/api/v1/query?query=kube_pod_info' || true)
+        # An empty vector serialises as "result":[], so require a populated one.
+        if echo "${RESULT}" | grep -q '"__name__":"kube_pod_info"'; then
+            echo "kube_pod_info arrived in Prometheus"
+            FOUND=true
+            break
         fi
-        echo "Metric not found yet..."
+        echo "metric not found yet ($i)"
         sleep 2
     done
 
-    if [ "$FOUND" = false ]; then
-        echo "Failed to verify OTLP HTTP export."
+    if [ "${FOUND}" = false ]; then
+        echo "Failed to verify the OTLP HTTP export."
         kubectl logs deployment/kube-state-metrics -n kube-system
         exit 1
     fi
 
+    # The exporter's resource attributes must survive the conversion: Prometheus
+    # derives the job label from service.name, so this fails if the resource is
+    # empty or unnamed.
+    if ! echo "${RESULT}" | grep -q '"job":"kube-state-metrics"'; then
+        echo "Expected job=\"kube-state-metrics\" derived from the OTLP resource, got:"
+        echo "${RESULT}"
+        kubectl logs deployment/kube-state-metrics -n kube-system
+        exit 1
+    fi
+
+    # Prometheus turns the OTLP resource attributes into target_info. It is
+    # absent when the exporter sends a nil resource, and misses the
+    # telemetry_sdk_* attributes when the resource replaces resource.Default()
+    # rather than extending it -- which is also what makes OTEL_RESOURCE_ATTRIBUTES
+    # work.
+    #
+    # The metric descriptions are covered by unit tests instead: Prometheus only
+    # serves /api/v1/metadata for scrape targets, so metadata ingested over OTLP
+    # is not queryable here.
+    TARGET_INFO=$(curl -s -g 'http://localhost:9090/api/v1/query?query=target_info' || true)
+    if ! echo "${TARGET_INFO}" | grep -q '"service_version"'; then
+        echo "Expected target_info to carry the OTLP resource attributes, got: ${TARGET_INFO}"
+        kubectl logs deployment/kube-state-metrics -n kube-system
+        exit 1
+    fi
+    if ! echo "${TARGET_INFO}" | grep -q '"telemetry_sdk_name":"opentelemetry"'; then
+        echo "Expected target_info to retain the SDK attributes from resource.Default(), got: ${TARGET_INFO}"
+        exit 1
+    fi
+    echo "OTLP resource attributes: ${TARGET_INFO}"
+
     kubectl delete -k ./examples/standard/
     rm ./tests/e2e/otlp/deployment-temp.yaml
-    
-    # Cleanup Prometheus
-    kill $PF_PID || true
+
+    stop_prometheus_port_forward
     kubectl delete -f ./tests/e2e/otlp/prometheus.yaml
     echo "OTLP tests passed."
 }
