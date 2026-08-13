@@ -308,6 +308,10 @@ func RunKubeStateMetrics(ctx context.Context, opts *options.Options) error {
 		storeBuilder,
 		opts.EnableGZIPEncoding,
 	)
+	// Include kube-state-metrics' own telemetry in the OTLP export: a push-only
+	// deployment never scrapes the telemetry port, so this is otherwise the one
+	// signal it cannot see.
+	m.SetSelfMetricsGatherer(ksmMetricsRegistry)
 	// Run MetricsHandler
 	ctxMetricsHandler, cancel := context.WithCancel(ctx)
 	defer cancel()

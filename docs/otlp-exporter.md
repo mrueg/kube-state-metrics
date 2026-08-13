@@ -17,6 +17,7 @@ The OTLP exporter is disabled by default. You can enable and configure it using 
 | `--otlp-insecure` | Allow insecure connections (no TLS) to the OTLP receiver. | `false` |
 | `--otlp-interval` | The interval at which metrics are exported. Must be greater than 0. | `1m0s` |
 | `--otlp-url-path` | Override the URL path of the OTLP HTTP receiver. Ignored for `grpc`. | `""` |
+| `--otlp-compression` | Compression for the export payload: `gzip` or `none`. | `gzip` |
 
 ### Examples
 
@@ -62,8 +63,28 @@ All data points of a metric are folded into a single OTLP metric, regardless of
 how many Kubernetes objects contributed to it. Cumulative sums report the time
 the exporter started as their start timestamp.
 
-Exported batches carry the resource attributes `service.name=kube-state-metrics`
-and `service.version`.
+Exported batches carry the resource attributes `service.name=kube-state-metrics`,
+`service.version` and `service.instance.id`. The instance id is taken from
+`--pod` when set (the downward API value used for autosharding) and otherwise
+from the hostname, so each replica of a sharded deployment is a distinct target.
+Without it every shard would report the same identity and their `target_info`
+samples would interleave into a single series.
+
+`OTEL_RESOURCE_ATTRIBUTES` and `OTEL_SERVICE_NAME` are honoured and take
+precedence over all three -- this is how you attach cluster identity in a
+multi-cluster setup. They are read once, when the process starts.
+
+kube-state-metrics' own telemetry (the `kube_state_metrics_*` families otherwise
+served on the telemetry port) is exported too, so a push-only deployment can
+still alert on `kube_state_metrics_watch_total{result="error"}` and the
+config-reload metrics. Prometheus summaries among them are skipped: the OTLP
+Summary type exists only for backwards compatibility.
+
+Metric units are not populated. kube-state-metrics has no family-level unit
+metadata -- units are encoded in metric names (`_seconds`, `_bytes`) and, for
+resource metrics, in a `unit` label -- and receivers that append a unit suffix
+during translation could otherwise produce names like
+`kube_pod_start_time_seconds_seconds`.
 
 > [!NOTE]
 > Enabling the exporter makes each store retain its generated metric families in

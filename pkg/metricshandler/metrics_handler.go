@@ -27,6 +27,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/expfmt"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -47,6 +48,9 @@ type MetricsHandler struct {
 	kubeClient   kubernetes.Interface
 	storeBuilder ksmtypes.BuilderInterface
 	opts         *options.Options
+	// selfGatherer exposes kube-state-metrics' own telemetry registry to the
+	// OTLP exporter. Nil unless SetSelfMetricsGatherer was called.
+	selfGatherer prometheus.Gatherer
 
 	cancel func()
 

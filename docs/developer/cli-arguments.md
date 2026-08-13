@@ -71,6 +71,7 @@ Flags:
       --node string                                          Name of the node that contains the kube-state-metrics pod. Most likely it should be passed via the downward API. This is used for daemonset sharding. Only available for resources (pod metrics) that support spec.nodeName fieldSelector. This is experimental.
       --object-limit int                                     The total number of objects to list per resource from the API Server. (experimental)
       --one_output                                           If true, only write logs to their native severity level (vs also writing to each lower severity level; no effect when -logtostderr=true)
+      --otlp-compression string                              Compression to use for OTLP export (gzip or none). (experimental) (default "gzip")
       --otlp-endpoint string                                 The endpoint for OTLP export. (experimental)
       --otlp-insecure                                        Enable insecure OTLP connection. (experimental)
       --otlp-interval duration                               The interval for OTLP export. (experimental) (default 1m0s)

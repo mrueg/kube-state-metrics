@@ -85,6 +85,7 @@ type Options struct {
 	OTLPInsecure     bool          `yaml:"otlp_insecure"`
 	OTLPInterval     time.Duration `yaml:"otlp_interval"`
 	OTLPURLPath      string        `yaml:"otlp_url_path"`
+	OTLPCompression  string        `yaml:"otlp_compression"`
 
 	Shard                int32 `yaml:"shard"`
 	AutoGoMemlimit       bool  `yaml:"auto-gomemlimit"`
@@ -205,6 +206,7 @@ func (o *Options) AddFlags(cmd *cobra.Command) {
 	o.cmd.Flags().BoolVar(&o.OTLPInsecure, "otlp-insecure", false, "Enable insecure OTLP connection. (experimental)")
 	o.cmd.Flags().DurationVar(&o.OTLPInterval, "otlp-interval", 60*time.Second, "The interval for OTLP export. (experimental)")
 	o.cmd.Flags().StringVar(&o.OTLPURLPath, "otlp-url-path", "", "The URL path for OTLP HTTP export. (experimental)")
+	o.cmd.Flags().StringVar(&o.OTLPCompression, "otlp-compression", "gzip", "Compression to use for OTLP export (gzip or none). (experimental)")
 }
 
 // Parse parses the flag definitions from the argument list.
@@ -248,6 +250,9 @@ func (o *Options) Validate() error {
 		// time.NewTicker panics on a non-positive interval.
 		if o.OTLPInterval <= 0 {
 			return fmt.Errorf("value for --otlp-interval=%s must be greater than 0", o.OTLPInterval)
+		}
+		if o.OTLPCompression != "gzip" && o.OTLPCompression != "none" {
+			return fmt.Errorf("value for --otlp-compression=%s must be either 'gzip' or 'none'", o.OTLPCompression)
 		}
 	}
 
