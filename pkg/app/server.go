@@ -271,6 +271,9 @@ func RunKubeStateMetrics(ctx context.Context, opts *options.Options) error {
 
 	storeBuilder.WithUsingAPIServerCache(opts.UseAPIServerCache)
 	storeBuilder.WithObjectLimit(opts.ObjectLimit)
+	// Only the OTLP exporter reads MetricsStore.Export, and retaining the
+	// families to serve it costs memory for every stored object.
+	storeBuilder.WithRetainMetricFamilies(opts.EnableOTLPExport)
 	storeBuilder.WithGenerateStoresFunc(storeBuilder.DefaultGenerateStoresFunc())
 	proc.StartReaper()
 

@@ -245,6 +245,10 @@ func (o *Options) Validate() error {
 		if o.OTLPProtocol != "grpc" && o.OTLPProtocol != "http" {
 			return fmt.Errorf("--otlp-protocol must be either 'grpc' or 'http'")
 		}
+		// time.NewTicker panics on a non-positive interval.
+		if o.OTLPInterval <= 0 {
+			return fmt.Errorf("value for --otlp-interval=%s must be greater than 0", o.OTLPInterval)
+		}
 	}
 
 	return nil

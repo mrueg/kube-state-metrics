@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Kubernetes Authors All rights reserved.
+Copyright 2026 The Kubernetes Authors All rights reserved.
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -18,18 +18,54 @@ package metricshandler
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"time"
 
+	"github.com/prometheus/common/version"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/sdk/instrumentation"
 	"go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/sdk/resource"
 	"k8s.io/klog/v2"
 
 	ksmmetric "k8s.io/kube-state-metrics/v2/pkg/metric"
+	"k8s.io/kube-state-metrics/v2/pkg/options"
 )
+
+const (
+	// otlpExporterInitTimeout bounds construction of the exporter.
+	otlpExporterInitTimeout = 5 * time.Second
+	// otlpShutdownTimeout bounds the final flush. The context handed to
+	// RunOTLPExport is already cancelled by then, so without a bound of its own
+	// an unreachable collector would stall process shutdown indefinitely.
+	otlpShutdownTimeout = 5 * time.Second
+)
+
+var pluginScope = instrumentation.Scope{
+	Name:    "k8s.io/kube-state-metrics",
+	Version: version.Version,
+}
+
+// validateOTLPOptions checks the OTLP flags. Options.Validate covers the same
+// ground, but it is unreachable from main today (it is called after Parse,
+// which never returns), and an interval of zero reaches time.NewTicker, which
+// panics. Checking here keeps a misconfiguration a startup error.
+func validateOTLPOptions(opts *options.Options) error {
+	if opts.OTLPEndpoint == "" {
+		return errors.New("--otlp-endpoint must be set when --enable-otlp-export is true")
+	}
+	if opts.OTLPProtocol != "grpc" && opts.OTLPProtocol != "http" {
+		return fmt.Errorf("--otlp-protocol must be either %q or %q, got %q", "grpc", "http", opts.OTLPProtocol)
+	}
+	if opts.OTLPInterval <= 0 {
+		return fmt.Errorf("--otlp-interval must be greater than 0, got %s", opts.OTLPInterval)
+	}
+	return nil
+}
 
 // RunOTLPExport runs the OTLP exporter loop.
 func (m *MetricsHandler) RunOTLPExport(ctx context.Context) error {
@@ -37,38 +73,26 @@ func (m *MetricsHandler) RunOTLPExport(ctx context.Context) error {
 		return nil
 	}
 
-	klog.InfoS("Starting OTLP exporter", "endpoint", m.opts.OTLPEndpoint, "protocol", m.opts.OTLPProtocol, "interval", m.opts.OTLPInterval)
-
-	var exporter metric.Exporter
-	var err error
-
-	ctxTimeout, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-
-	if m.opts.OTLPProtocol == "http" {
-		opts := []otlpmetrichttp.Option{
-			otlpmetrichttp.WithEndpoint(m.opts.OTLPEndpoint),
-		}
-		if m.opts.OTLPURLPath != "" {
-			opts = append(opts, otlpmetrichttp.WithURLPath(m.opts.OTLPURLPath))
-		}
-		if m.opts.OTLPInsecure {
-			opts = append(opts, otlpmetrichttp.WithInsecure())
-		}
-		exporter, err = otlpmetrichttp.New(ctxTimeout, opts...)
-	} else {
-		opts := []otlpmetricgrpc.Option{
-			otlpmetricgrpc.WithEndpoint(m.opts.OTLPEndpoint),
-		}
-		if m.opts.OTLPInsecure {
-			opts = append(opts, otlpmetricgrpc.WithInsecure())
-		}
-		exporter, err = otlpmetricgrpc.New(ctxTimeout, opts...)
+	if err := validateOTLPOptions(m.opts); err != nil {
+		return err
 	}
 
+	klog.InfoS("Starting OTLP exporter", "endpoint", m.opts.OTLPEndpoint, "protocol", m.opts.OTLPProtocol, "interval", m.opts.OTLPInterval)
+
+	exporter, err := newOTLPExporter(ctx, m.opts)
 	if err != nil {
 		return err
 	}
+
+	res := resource.NewSchemaless(
+		attribute.String("service.name", "kube-state-metrics"),
+		attribute.String("service.version", version.Version),
+	)
+
+	// Cumulative sums are only interpretable against the point in time the
+	// counters started from. Every export reports the same start, which is when
+	// this exporter came up.
+	startTime := time.Now()
 
 	ticker := time.NewTicker(m.opts.OTLPInterval)
 	defer ticker.Stop()
@@ -76,19 +100,56 @@ func (m *MetricsHandler) RunOTLPExport(ctx context.Context) error {
 	for {
 		select {
 		case <-ctx.Done():
-			return exporter.Shutdown(context.Background())
+			return shutdownOTLPExporter(exporter)
 		case <-ticker.C:
-			rm := m.gatherOTLPMetrics()
-			if rm != nil {
-				if err := exporter.Export(ctx, rm); err != nil {
-					klog.ErrorS(err, "Failed to export metrics to OTLP")
-				}
+			rm := m.gatherOTLPMetrics(res, startTime, time.Now())
+			if rm == nil {
+				continue
+			}
+			if err := exporter.Export(ctx, rm); err != nil {
+				klog.ErrorS(err, "Failed to export metrics to OTLP")
 			}
 		}
 	}
 }
 
-func (m *MetricsHandler) gatherOTLPMetrics() *metricdata.ResourceMetrics {
+// shutdownOTLPExporter flushes and closes the exporter. The context that drove
+// the export loop is already cancelled by the time this runs, so the flush gets
+// a fresh, bounded one of its own -- otherwise an unreachable collector would
+// hold up process shutdown.
+func shutdownOTLPExporter(exporter metric.Exporter) error {
+	ctx, cancel := context.WithTimeout(context.Background(), otlpShutdownTimeout)
+	defer cancel()
+	return exporter.Shutdown(ctx)
+}
+
+func newOTLPExporter(ctx context.Context, opts *options.Options) (metric.Exporter, error) {
+	ctxTimeout, cancel := context.WithTimeout(ctx, otlpExporterInitTimeout)
+	defer cancel()
+
+	if opts.OTLPProtocol == "http" {
+		httpOpts := []otlpmetrichttp.Option{
+			otlpmetrichttp.WithEndpoint(opts.OTLPEndpoint),
+		}
+		if opts.OTLPURLPath != "" {
+			httpOpts = append(httpOpts, otlpmetrichttp.WithURLPath(opts.OTLPURLPath))
+		}
+		if opts.OTLPInsecure {
+			httpOpts = append(httpOpts, otlpmetrichttp.WithInsecure())
+		}
+		return otlpmetrichttp.New(ctxTimeout, httpOpts...)
+	}
+
+	grpcOpts := []otlpmetricgrpc.Option{
+		otlpmetricgrpc.WithEndpoint(opts.OTLPEndpoint),
+	}
+	if opts.OTLPInsecure {
+		grpcOpts = append(grpcOpts, otlpmetricgrpc.WithInsecure())
+	}
+	return otlpmetricgrpc.New(ctxTimeout, grpcOpts...)
+}
+
+func (m *MetricsHandler) gatherOTLPMetrics(res *resource.Resource, startTime, now time.Time) *metricdata.ResourceMetrics {
 	m.mtx.RLock()
 	writers := m.metricsWriters
 	m.mtx.RUnlock()
@@ -97,81 +158,130 @@ func (m *MetricsHandler) gatherOTLPMetrics() *metricdata.ResourceMetrics {
 		return nil
 	}
 
-	var allMetrics []metricdata.Metrics
+	agg := newOTLPAggregator()
 
 	for _, w := range writers {
 		for _, s := range w.Stores() {
-			families := s.Export()
-			for _, familyList := range families {
-				for _, f := range familyList {
+			help := s.FamilyHelp()
+			for _, familyList := range s.Export() {
+				for i, f := range familyList {
+					var description string
+					if i < len(help) {
+						description = help[i]
+					}
 					f.Inspect(func(fam ksmmetric.Family) {
-						md := convertToOTLP(fam)
-						allMetrics = append(allMetrics, md)
+						agg.add(fam, description, startTime, now)
 					})
 				}
 			}
 		}
 	}
 
+	metrics := agg.metrics()
+	if len(metrics) == 0 {
+		return nil
+	}
+
 	return &metricdata.ResourceMetrics{
+		Resource: res,
 		ScopeMetrics: []metricdata.ScopeMetrics{
 			{
 				Scope:   pluginScope,
-				Metrics: allMetrics,
+				Metrics: metrics,
 			},
 		},
 	}
 }
 
-var pluginScope = instrumentation.Scope{
-	Name:    "k8s.io/kube-state-metrics",
-	Version: "v2",
+// otlpAggregator folds the per-object families the stores hand out into one
+// metricdata.Metrics per metric name. Export yields one family list per
+// Kubernetes object, so a name comes back once per object; OTLP expects a
+// metric to appear once per scope carrying all of its data points, and emitting
+// thousands of same-named entries repeats the name, description and type on the
+// wire for every object.
+type otlpAggregator struct {
+	order  []string
+	byName map[string]*aggregatedFamily
 }
 
-func convertToOTLP(f ksmmetric.Family) metricdata.Metrics {
-	md := metricdata.Metrics{
-		Name:        f.Name,
-		Description: "", // Help text not easily available here, assuming consistent
-		Unit:        "",
-	}
-
-	switch f.Type {
-	case ksmmetric.Gauge, ksmmetric.Info, ksmmetric.StateSet:
-		dataPoints := make([]metricdata.DataPoint[float64], 0, len(f.Metrics))
-		for _, m := range f.Metrics {
-			dataPoints = append(dataPoints, metricdata.DataPoint[float64]{
-				Attributes: createAttributes(m.LabelKeys, m.LabelValues),
-				Value:      m.Value,
-				Time:       time.Now(),
-			})
-		}
-		md.Data = metricdata.Gauge[float64]{
-			DataPoints: dataPoints,
-		}
-	case ksmmetric.Counter:
-		dataPoints := make([]metricdata.DataPoint[float64], 0, len(f.Metrics))
-		for _, m := range f.Metrics {
-			dataPoints = append(dataPoints, metricdata.DataPoint[float64]{
-				Attributes: createAttributes(m.LabelKeys, m.LabelValues),
-				Value:      m.Value,
-				Time:       time.Now(),
-			})
-		}
-		md.Data = metricdata.Sum[float64]{
-			DataPoints:  dataPoints,
-			IsMonotonic: true,
-			Temporality: metricdata.CumulativeTemporality,
-		}
-	}
-	return md
+type aggregatedFamily struct {
+	name        string
+	description string
+	familyType  ksmmetric.Type
+	points      []metricdata.DataPoint[float64]
 }
 
-func createAttributes(keys, values []string) attribute.Set {
+func newOTLPAggregator() *otlpAggregator {
+	return &otlpAggregator{byName: map[string]*aggregatedFamily{}}
+}
+
+func (a *otlpAggregator) add(fam ksmmetric.Family, description string, startTime, now time.Time) {
+	af, ok := a.byName[fam.Name]
+	if !ok {
+		af = &aggregatedFamily{
+			name:        fam.Name,
+			description: description,
+			familyType:  fam.Type,
+		}
+		a.byName[fam.Name] = af
+		a.order = append(a.order, fam.Name)
+	}
+
+	for _, m := range fam.Metrics {
+		attrs, ok := createAttributes(m.LabelKeys, m.LabelValues)
+		if !ok {
+			klog.V(4).InfoS("Skipping metric whose label keys and values differ in length", "family", fam.Name)
+			continue
+		}
+		af.points = append(af.points, metricdata.DataPoint[float64]{
+			Attributes: attrs,
+			Value:      m.Value,
+			StartTime:  startTime,
+			Time:       now,
+		})
+	}
+}
+
+func (a *otlpAggregator) metrics() []metricdata.Metrics {
+	out := make([]metricdata.Metrics, 0, len(a.order))
+	for _, name := range a.order {
+		af := a.byName[name]
+		md := metricdata.Metrics{
+			Name:        af.name,
+			Description: af.description,
+		}
+
+		switch af.familyType {
+		case ksmmetric.Gauge, ksmmetric.Info, ksmmetric.StateSet:
+			md.Data = metricdata.Gauge[float64]{DataPoints: af.points}
+		case ksmmetric.Counter:
+			md.Data = metricdata.Sum[float64]{
+				DataPoints:  af.points,
+				IsMonotonic: true,
+				Temporality: metricdata.CumulativeTemporality,
+			}
+		default:
+			// A Metrics with no Data is malformed, so drop the family rather
+			// than hand the exporter something it cannot encode.
+			klog.V(2).InfoS("Skipping metric family with an unsupported type", "family", af.name, "type", af.familyType)
+			continue
+		}
+
+		out = append(out, md)
+	}
+	return out
+}
+
+// createAttributes converts a metric's label keys and values into an attribute
+// set. It reports false when the two differ in length, which would otherwise
+// silently drop or mispair labels.
+func createAttributes(keys, values []string) (attribute.Set, bool) {
+	if len(keys) != len(values) {
+		return *attribute.EmptySet(), false
+	}
 	kv := make([]attribute.KeyValue, 0, len(keys))
 	for i, k := range keys {
-		if i < len(values) {
-			kv = append(kv, attribute.String(k, values[i]))
-		}
+		kv = append(kv, attribute.String(k, values[i]))
 	}
-	return attribute.NewSet(kv...)
+	return attribute.NewSet(kv...), true
 }

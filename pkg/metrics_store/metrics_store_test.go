@@ -182,3 +182,38 @@ func BenchmarkAdd(b *testing.B) {
 		}
 	}
 }
+
+// Retaining the generated families costs memory for every stored object, so it
+// only happens when something actually reads Export.
+func TestExportRequiresFamilyRetention(t *testing.T) {
+	gen := func(interface{}) []metric.FamilyInterface {
+		return []metric.FamilyInterface{
+			&metric.Family{Name: "kube_test_info", Type: metric.Gauge,
+				Metrics: []*metric.Metric{{Value: 1}}},
+		}
+	}
+	headers := []string{"# HELP kube_test_info Information about the thing.\n# TYPE kube_test_info gauge"}
+
+	obj := &v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: "uid-1", Name: "p", Namespace: "ns"}}
+
+	off := NewMetricsStore(headers, gen)
+	if err := off.Add(obj); err != nil {
+		t.Fatal(err)
+	}
+	if got := off.Export(); got != nil {
+		t.Errorf("expected Export to return nothing without retention, got %d entries", len(got))
+	}
+
+	on := NewMetricsStore(headers, gen, WithFamilyRetention())
+	if err := on.Add(obj); err != nil {
+		t.Fatal(err)
+	}
+	got := on.Export()
+	if len(got) != 1 || len(got[0]) != 1 {
+		t.Fatalf("expected one family for one object, got %v", got)
+	}
+
+	if help := on.FamilyHelp(); len(help) != 1 || help[0] != "Information about the thing." {
+		t.Errorf("FamilyHelp() = %q, want the header's help text", help)
+	}
+}
