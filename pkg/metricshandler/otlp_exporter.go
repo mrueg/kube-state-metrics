@@ -20,6 +20,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/prometheus/common/version"
@@ -39,6 +40,10 @@ import (
 const (
 	// otlpExporterInitTimeout bounds construction of the exporter.
 	otlpExporterInitTimeout = 5 * time.Second
+	// otlpInitialRetryBackoff and otlpMaxRetryBackoff bound the wait between
+	// attempts to construct the exporter.
+	otlpInitialRetryBackoff = time.Second
+	otlpMaxRetryBackoff     = time.Minute
 	// otlpShutdownTimeout bounds the final flush. The context handed to
 	// RunOTLPExport is already cancelled by then, so without a bound of its own
 	// an unreachable collector would stall process shutdown indefinitely.
@@ -79,15 +84,13 @@ func (m *MetricsHandler) RunOTLPExport(ctx context.Context) error {
 
 	klog.InfoS("Starting OTLP exporter", "endpoint", m.opts.OTLPEndpoint, "protocol", m.opts.OTLPProtocol, "interval", m.opts.OTLPInterval)
 
-	exporter, err := newOTLPExporter(ctx, m.opts)
+	exporter, err := newOTLPExporterWithRetry(ctx, m.opts)
 	if err != nil {
-		return err
+		// The context was cancelled while retrying, i.e. shutdown.
+		return nil
 	}
 
-	res := resource.NewSchemaless(
-		attribute.String("service.name", "kube-state-metrics"),
-		attribute.String("service.version", version.Version),
-	)
+	res := otlpResource()
 
 	// Cumulative sums are only interpretable against the point in time the
 	// counters started from. Every export reports the same start, which is when
@@ -109,6 +112,88 @@ func (m *MetricsHandler) RunOTLPExport(ctx context.Context) error {
 			if err := exporter.Export(ctx, rm); err != nil {
 				klog.ErrorS(err, "Failed to export metrics to OTLP")
 			}
+		}
+	}
+}
+
+// otlpResource describes the process the metrics come from.
+//
+// resource.Default() carries the OTEL_SERVICE_NAME and OTEL_RESOURCE_ATTRIBUTES
+// values, which is how an operator attaches cluster identity in a multi-cluster
+// setup, so it is the base rather than something to replace. Our own values are
+// layered on top only where the environment has not already supplied them --
+// resource.Default() falls back to "unknown_service:<binary>" when nothing names
+// the service, and that fallback should lose to our name but an explicit
+// setting should win.
+func otlpResource() *resource.Resource {
+	base := resource.Default()
+
+	var attrs []attribute.KeyValue
+	if !hasServiceName(base) {
+		attrs = append(attrs, attribute.String("service.name", "kube-state-metrics"))
+	}
+	if !hasAttribute(base, "service.version") {
+		attrs = append(attrs, attribute.String("service.version", version.Version))
+	}
+	if len(attrs) == 0 {
+		return base
+	}
+
+	merged, err := resource.Merge(base, resource.NewWithAttributes(base.SchemaURL(), attrs...))
+	if err != nil {
+		klog.ErrorS(err, "Failed to build the OTLP resource, falling back to the default")
+		return base
+	}
+	return merged
+}
+
+func hasAttribute(res *resource.Resource, key string) bool {
+	for _, kv := range res.Attributes() {
+		if string(kv.Key) == key {
+			return true
+		}
+	}
+	return false
+}
+
+// hasServiceName reports whether the resource names the service as something
+// other than resource.Default()'s "unknown_service:<binary>" placeholder.
+func hasServiceName(res *resource.Resource) bool {
+	for _, kv := range res.Attributes() {
+		if string(kv.Key) == "service.name" {
+			return !strings.HasPrefix(kv.Value.AsString(), "unknown_service")
+		}
+	}
+	return false
+}
+
+// newOTLPExporterWithRetry keeps trying until the exporter is built or the
+// context is cancelled.
+//
+// Returning the error instead would end this run group actor, and the group
+// interrupts every other actor as soon as one returns -- so a push-path problem
+// would take the /metrics endpoint down with it. Flag validation still fails
+// fast, because that is a deterministic operator error caught before anything
+// starts; a construction failure is not necessarily permanent.
+func newOTLPExporterWithRetry(ctx context.Context, opts *options.Options) (metric.Exporter, error) {
+	backoff := otlpInitialRetryBackoff
+	for {
+		exporter, err := newOTLPExporter(ctx, opts)
+		if err == nil {
+			return exporter, nil
+		}
+
+		klog.ErrorS(err, "Failed to create the OTLP exporter, retrying",
+			"endpoint", opts.OTLPEndpoint, "protocol", opts.OTLPProtocol, "retryIn", backoff)
+
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(backoff):
+		}
+
+		if backoff *= 2; backoff > otlpMaxRetryBackoff {
+			backoff = otlpMaxRetryBackoff
 		}
 	}
 }

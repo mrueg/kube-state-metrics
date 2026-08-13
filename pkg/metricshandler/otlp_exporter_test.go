@@ -17,11 +17,15 @@ limitations under the License.
 package metricshandler
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
+	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
+	"go.opentelemetry.io/otel/sdk/resource"
 
 	ksmmetric "k8s.io/kube-state-metrics/v2/pkg/metric"
 	"k8s.io/kube-state-metrics/v2/pkg/options"
@@ -185,5 +189,106 @@ func TestValidateOTLPOptions(t *testing.T) {
 				t.Errorf("error = %q, want it to contain %q", err, tt.wantErr)
 			}
 		})
+	}
+}
+
+// resource.Default() carries OTEL_SERVICE_NAME / OTEL_RESOURCE_ATTRIBUTES, which
+// is how cluster identity is attached in a multi-cluster setup. Our own values
+// must not paper over it.
+func TestOTLPResourceRespectsEnvironment(t *testing.T) {
+	attrOf := func(res *resource.Resource, key string) (string, bool) {
+		for _, kv := range res.Attributes() {
+			if string(kv.Key) == key {
+				return kv.Value.AsString(), true
+			}
+		}
+		return "", false
+	}
+
+	t.Run("defaults to our own service name", func(t *testing.T) {
+		res := otlpResource()
+		got, ok := attrOf(res, "service.name")
+		if !ok || got != "kube-state-metrics" {
+			t.Errorf("service.name = %q (present=%v), want %q", got, ok, "kube-state-metrics")
+		}
+		if _, ok := attrOf(res, "service.version"); !ok {
+			t.Error("service.version missing")
+		}
+	})
+
+	t.Run("carries extra resource attributes through", func(t *testing.T) {
+		// resource.Default caches on first use, so this only exercises the
+		// merge when it is the first call in the process. Assert the mechanism
+		// instead: an environment-provided name must survive.
+		base := resource.NewWithAttributes(
+			resource.Default().SchemaURL(),
+			attribute.String("service.name", "ksm-prod"),
+			attribute.String("k8s.cluster.name", "prod-eu"),
+		)
+		if !hasServiceName(base) {
+			t.Fatal("an explicit service.name should be recognised")
+		}
+		if hasServiceName(resource.NewWithAttributes(
+			resource.Default().SchemaURL(),
+			attribute.String("service.name", "unknown_service:kube-state-metrics"),
+		)) {
+			t.Error("the unknown_service placeholder must not count as explicit")
+		}
+		if !hasAttribute(base, "k8s.cluster.name") {
+			t.Error("hasAttribute failed to find a present key")
+		}
+		if hasAttribute(base, "service.version") {
+			t.Error("hasAttribute found an absent key")
+		}
+	})
+}
+
+// A failure to build the exporter must not end the run group actor, because the
+// group interrupts every other actor -- including the /metrics server -- as soon
+// as one returns.
+func TestNewOTLPExporterWithRetryStopsOnContextCancel(t *testing.T) {
+	o := &options.Options{
+		EnableOTLPExport: true,
+		// A scheme and path make WithEndpoint fail to parse, so construction
+		// keeps failing and the retry loop keeps going.
+		OTLPEndpoint: "http://example.com:4318/v1/metrics",
+		OTLPProtocol: "http",
+		OTLPInterval: time.Second,
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := newOTLPExporterWithRetry(ctx, o)
+		done <- err
+	}()
+
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("expected the retry loop to end on context cancellation, got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("retry loop did not return after the context was cancelled")
+	}
+}
+
+// The same failure, driven through RunOTLPExport: it must return nil on
+// shutdown rather than surfacing the construction error.
+func TestRunOTLPExportSurvivesAnUnbuildableExporter(t *testing.T) {
+	m := &MetricsHandler{opts: &options.Options{
+		EnableOTLPExport: true,
+		OTLPEndpoint:     "http://example.com:4318/v1/metrics",
+		OTLPProtocol:     "http",
+		OTLPInterval:     time.Second,
+	}}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+	defer cancel()
+
+	if err := m.RunOTLPExport(ctx); err != nil {
+		t.Errorf("RunOTLPExport should not report a construction failure as an actor error, got %v", err)
 	}
 }
