@@ -51,10 +51,10 @@ fails at startup with an "invalid port" parse error.
 
 `kube-state-metrics` converts its internal metrics (which follow the OpenMetrics/Prometheus model) to OTLP metrics as follows:
 
-*   **Gauge** -> OTLP Gauge
-*   **Counter** -> OTLP Sum (Monotonic, Cumulative)
-*   **Info** -> OTLP Gauge (value 1, labels as attributes)
-*   **StateSet** -> OTLP Gauge (value 0 or 1 per series)
+* **Gauge** -> OTLP Gauge
+* **Counter** -> OTLP Sum (Monotonic, Cumulative)
+* **Info** -> OTLP Gauge (value 1, labels as attributes)
+* **StateSet** -> OTLP Gauge (value 0 or 1 per series)
 
 Labels are converted to OTLP Attributes, and each metric's `# HELP` text is
 carried across as the OTLP metric description.
