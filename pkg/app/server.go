@@ -338,9 +338,11 @@ func RunKubeStateMetrics(ctx context.Context, opts *options.Options) error {
 	storesCtx, stopStores := context.WithCancel(context.WithoutCancel(ctx))
 	defer stopStores()
 
-	// Run OTLP Exporter
+	// Run OTLP Exporter. It stops with the stores rather than with ctx: its
+	// returning would end the run group, cutting --shutdown-delay short, and
+	// the stores keep being exported while the servers drain.
 	if opts.EnableOTLPExport {
-		ctxOTLP, cancelOTLP := context.WithCancel(ctx)
+		ctxOTLP, cancelOTLP := context.WithCancel(storesCtx)
 		g.Add(func() error {
 			return m.RunOTLPExport(ctxOTLP)
 		}, func(error) {
