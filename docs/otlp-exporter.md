@@ -59,9 +59,17 @@ fails at startup with an "invalid port" parse error.
 Labels are converted to OTLP Attributes, and each metric's `# HELP` text is
 carried across as the OTLP metric description.
 
-All data points of a metric are folded into a single OTLP metric, regardless of
-how many Kubernetes objects contributed to it. Cumulative sums report the time
-the exporter started as their start timestamp.
+The exporter reads the same rendered metrics that `/metrics` serves, so an
+export carries exactly the series a scrape would, after the same allow and deny
+lists and sharding. The data points of a metric are grouped into as few OTLP
+metrics as possible. Cumulative sums report the time the exporter started as
+their start timestamp; gauges carry no start timestamp.
+
+A cluster's metrics are usually far larger than the 4 MiB the OpenTelemetry
+Collector accepts in one gRPC message by default, so each export is sent as a
+series of requests of at most about 2 MiB each, before compression. If a
+request fails, the rest of that export is skipped and the next interval sends
+everything again.
 
 Exported batches carry the resource attributes `service.name=kube-state-metrics`,
 `service.version` and `service.instance.id`. The instance id is taken from
@@ -85,8 +93,3 @@ metadata -- units are encoded in metric names (`_seconds`, `_bytes`) and, for
 resource metrics, in a `unit` label -- and receivers that append a unit suffix
 during translation could otherwise produce names like
 `kube_pod_start_time_seconds_seconds`.
-
-> [!NOTE]
-> Enabling the exporter makes each store retain its generated metric families in
-> addition to their rendered exposition bytes, which increases memory use per
-> watched object. Nothing is retained while `--enable-otlp-export` is `false`.

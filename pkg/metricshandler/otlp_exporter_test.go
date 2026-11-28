@@ -25,114 +25,11 @@ import (
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
-	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
 
-	ksmmetric "k8s.io/kube-state-metrics/v2/pkg/metric"
 	"k8s.io/kube-state-metrics/v2/pkg/options"
 )
 
-func gaugeFamily(name string, value float64) ksmmetric.Family {
-	return ksmmetric.Family{
-		Name: name,
-		Type: ksmmetric.Gauge,
-		Metrics: []*ksmmetric.Metric{
-			{LabelKeys: []string{"pod"}, LabelValues: []string{"p"}, Value: value},
-		},
-	}
-}
-
-// Export hands out one family list per Kubernetes object, so the same metric
-// name arrives once per object. OTLP expects one Metrics per name carrying all
-// of its data points.
-func TestOTLPAggregatorFoldsPerObjectFamilies(t *testing.T) {
-	now := time.Unix(1700000000, 0)
-	start := now.Add(-time.Hour)
-
-	agg := newOTLPAggregator()
-	for i := 0; i < 3; i++ {
-		agg.add(gaugeFamily("kube_pod_info", float64(i)), "Information about pod.", start, now)
-		agg.add(ksmmetric.Family{
-			Name: "kube_pod_restarts",
-			Type: ksmmetric.Counter,
-			Metrics: []*ksmmetric.Metric{
-				{LabelKeys: []string{"pod"}, LabelValues: []string{"p"}, Value: float64(i)},
-			},
-		}, "Restart count.", start, now)
-	}
-
-	got := agg.metrics()
-	if len(got) != 2 {
-		names := make([]string, 0, len(got))
-		for _, m := range got {
-			names = append(names, m.Name)
-		}
-		t.Fatalf("expected one Metrics per name, got %d: %v", len(got), names)
-	}
-
-	if got[0].Name != "kube_pod_info" || got[1].Name != "kube_pod_restarts" {
-		t.Errorf("unexpected names or order: %q, %q", got[0].Name, got[1].Name)
-	}
-	if got[0].Description != "Information about pod." {
-		t.Errorf("help text not carried through: %q", got[0].Description)
-	}
-
-	gauge, ok := got[0].Data.(metricdata.Gauge[float64])
-	if !ok {
-		t.Fatalf("expected a Gauge, got %T", got[0].Data)
-	}
-	if len(gauge.DataPoints) != 3 {
-		t.Errorf("expected 3 data points folded into one metric, got %d", len(gauge.DataPoints))
-	}
-
-	sum, ok := got[1].Data.(metricdata.Sum[float64])
-	if !ok {
-		t.Fatalf("expected a Sum, got %T", got[1].Data)
-	}
-	if len(sum.DataPoints) != 3 {
-		t.Errorf("expected 3 data points, got %d", len(sum.DataPoints))
-	}
-	// A cumulative point without a start time is not interpretable.
-	for _, dp := range sum.DataPoints {
-		if dp.StartTime.IsZero() {
-			t.Error("cumulative data point has no StartTime")
-		}
-		if !dp.Time.Equal(now) {
-			t.Errorf("data point time = %v, want the single collection time %v", dp.Time, now)
-		}
-	}
-}
-
-// A family type the switch does not handle would otherwise produce a Metrics
-// with a nil Data, which the exporter cannot encode.
-func TestOTLPAggregatorSkipsUnsupportedType(t *testing.T) {
-	agg := newOTLPAggregator()
-	agg.add(ksmmetric.Family{
-		Name:    "kube_weird",
-		Type:    ksmmetric.Type("histogram"),
-		Metrics: []*ksmmetric.Metric{{Value: 1}},
-	}, "", time.Now(), time.Now())
-
-	if got := agg.metrics(); len(got) != 0 {
-		t.Errorf("expected the family to be skipped, got %d metrics with Data=%v", len(got), got[0].Data)
-	}
-}
-
-func TestCreateAttributes(t *testing.T) {
-	if _, ok := createAttributes([]string{"a", "b"}, []string{"1"}); ok {
-		t.Error("expected a length mismatch to be rejected")
-	}
-	set, ok := createAttributes([]string{"a", "b"}, []string{"1", "2"})
-	if !ok {
-		t.Fatal("expected matching lengths to be accepted")
-	}
-	if set.Len() != 2 {
-		t.Errorf("expected 2 attributes, got %d", set.Len())
-	}
-}
-
-// A zero interval reaches time.NewTicker, which panics, so it has to be
-// rejected before the exporter loop starts.
 func TestValidateOTLPOptions(t *testing.T) {
 	valid := func() *options.Options {
 		return &options.Options{

@@ -81,10 +81,67 @@ func NewMetricsWriter(resourceName string, stores ...*MetricsStore) *MetricsWrit
 	}
 }
 
-// Stores returns the underlying stores.
-func (m *MetricsWriter) Stores() []*MetricsStore {
-	return m.stores
+// FamilyMetadata describes a metric family as declared by its header.
+type FamilyMetadata struct {
+	// Name is the name of the family.
+	Name string
+	// Help is the help text, unescaped.
+	Help string
+	// Type is the declared type, e.g. "gauge", "counter", "info" or
+	// "stateset".
+	Type string
 }
+
+// Families returns the metadata of the families the writer renders, indexed
+// the same way as the rendered families RangeObjects hands out.
+func (m *MetricsWriter) Families() []FamilyMetadata {
+	if len(m.stores) == 0 {
+		return nil
+	}
+	return m.stores[0].familyMetadata
+}
+
+// RangeObjects calls fn with the rendered families of each object in the
+// writer's stores, one byte slice per family in the text exposition format,
+// until fn returns false. The byte slices are shared with WriteAll and must not
+// be modified.
+func (m *MetricsWriter) RangeObjects(fn func(families [][]byte) bool) {
+	for _, s := range m.stores {
+		done := false
+		s.metrics.Range(func(_ any, value any) bool {
+			done = !fn(value.([][]byte))
+			return !done
+		})
+		if done {
+			return
+		}
+	}
+}
+
+// parseFamilyMetadata parses the name, help text and type that each header
+// declares.
+func parseFamilyMetadata(headers []string) []FamilyMetadata {
+	metadata := make([]FamilyMetadata, len(headers))
+	for i, h := range headers {
+		for line := range strings.Lines(h) {
+			line = strings.TrimSuffix(line, "\n")
+			switch {
+			case strings.HasPrefix(line, helpPrefix):
+				name, help, _ := strings.Cut(line[len(helpPrefix):], " ")
+				metadata[i].Name = name
+				metadata[i].Help = unescapeHelp.Replace(help)
+			case strings.HasPrefix(line, typePrefix):
+				name, typ, _ := strings.Cut(line[len(typePrefix):], " ")
+				metadata[i].Name = name
+				metadata[i].Type = typ
+			}
+		}
+	}
+	return metadata
+}
+
+// unescapeHelp reverses the escaping of backslashes and newlines in help text.
+var unescapeHelp = strings.NewReplacer(`\\`, `\`, `\n`, "\n")
 
 // WriteAll writes out metrics from the underlying stores to the given writer.
 //

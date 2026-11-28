@@ -30,11 +30,9 @@ import (
 	"go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetrichttp"
 	"go.opentelemetry.io/otel/sdk/instrumentation"
 	"go.opentelemetry.io/otel/sdk/metric"
-	"go.opentelemetry.io/otel/sdk/metric/metricdata"
 	"go.opentelemetry.io/otel/sdk/resource"
 	"k8s.io/klog/v2"
 
-	ksmmetric "k8s.io/kube-state-metrics/v2/pkg/metric"
 	"k8s.io/kube-state-metrics/v2/pkg/options"
 )
 
@@ -49,6 +47,11 @@ const (
 	// RunOTLPExport is already cancelled by then, so without a bound of its own
 	// an unreachable collector would stall process shutdown indefinitely.
 	otlpShutdownTimeout = 5 * time.Second
+	// otlpMaxRequestBytes bounds the estimated size of one export request. The
+	// metrics of a cluster are far larger than the 4 MiB the OpenTelemetry
+	// Collector accepts in one gRPC message by default, so they are sent in
+	// requests of about this size.
+	otlpMaxRequestBytes = 2 << 20
 )
 
 var pluginScope = instrumentation.Scope{
@@ -109,11 +112,7 @@ func (m *MetricsHandler) RunOTLPExport(ctx context.Context) error {
 		case <-ctx.Done():
 			return shutdownOTLPExporter(exporter)
 		case <-ticker.C:
-			rm := m.gatherOTLPMetrics(res, startTime, time.Now())
-			if rm == nil {
-				continue
-			}
-			if err := exporter.Export(ctx, rm); err != nil {
+			if err := m.exportOTLP(ctx, exporter, res, startTime, time.Now(), otlpMaxRequestBytes); err != nil {
 				klog.ErrorS(err, "Failed to export metrics to OTLP")
 			}
 		}
@@ -265,148 +264,4 @@ func newOTLPExporter(ctx context.Context, opts *options.Options) (metric.Exporte
 		grpcOpts = append(grpcOpts, otlpmetricgrpc.WithCompressor("gzip"))
 	}
 	return otlpmetricgrpc.New(ctxTimeout, grpcOpts...)
-}
-
-func (m *MetricsHandler) gatherOTLPMetrics(res *resource.Resource, startTime, now time.Time) *metricdata.ResourceMetrics {
-	m.mtx.RLock()
-	writers := m.metricsWriters
-	m.mtx.RUnlock()
-
-	if len(writers) == 0 {
-		return nil
-	}
-
-	agg := newOTLPAggregator()
-
-	for _, w := range writers {
-		for _, s := range w.Stores() {
-			help := s.FamilyHelp()
-			for _, familyList := range s.Export() {
-				for i, f := range familyList {
-					var description string
-					if i < len(help) {
-						description = help[i]
-					}
-					f.Inspect(func(fam ksmmetric.Family) {
-						agg.add(fam, description, startTime, now)
-					})
-				}
-			}
-		}
-	}
-
-	metrics := agg.metrics()
-	metrics = append(metrics, selfMetrics(m.selfGatherer, startTime, now)...)
-	if len(metrics) == 0 {
-		return nil
-	}
-
-	return &metricdata.ResourceMetrics{
-		Resource: res,
-		ScopeMetrics: []metricdata.ScopeMetrics{
-			{
-				Scope:   pluginScope,
-				Metrics: metrics,
-			},
-		},
-	}
-}
-
-// otlpAggregator folds the per-object families the stores hand out into one
-// metricdata.Metrics per metric name. Export yields one family list per
-// Kubernetes object, so a name comes back once per object; OTLP expects a
-// metric to appear once per scope carrying all of its data points, and emitting
-// thousands of same-named entries repeats the name, description and type on the
-// wire for every object.
-type otlpAggregator struct {
-	order  []string
-	byName map[string]*aggregatedFamily
-}
-
-type aggregatedFamily struct {
-	name        string
-	description string
-	familyType  ksmmetric.Type
-	points      []metricdata.DataPoint[float64]
-}
-
-func newOTLPAggregator() *otlpAggregator {
-	return &otlpAggregator{byName: map[string]*aggregatedFamily{}}
-}
-
-func (a *otlpAggregator) add(fam ksmmetric.Family, description string, startTime, now time.Time) {
-	af, ok := a.byName[fam.Name]
-	if !ok {
-		af = &aggregatedFamily{
-			name:        fam.Name,
-			description: description,
-			familyType:  fam.Type,
-		}
-		a.byName[fam.Name] = af
-		a.order = append(a.order, fam.Name)
-	}
-
-	for _, m := range fam.Metrics {
-		attrs, ok := createAttributes(m.LabelKeys, m.LabelValues)
-		if !ok {
-			klog.V(4).InfoS("Skipping metric whose label keys and values differ in length", "family", fam.Name)
-			continue
-		}
-		af.points = append(af.points, metricdata.DataPoint[float64]{
-			Attributes: attrs,
-			Value:      m.Value,
-			StartTime:  startTime,
-			Time:       now,
-		})
-	}
-}
-
-func (a *otlpAggregator) metrics() []metricdata.Metrics {
-	out := make([]metricdata.Metrics, 0, len(a.order))
-	for _, name := range a.order {
-		af := a.byName[name]
-		// Unit is deliberately left empty. kube-state-metrics has no
-		// family-level unit metadata -- units are encoded in the metric name
-		// (_seconds, _bytes) and, for resource metrics, in a "unit" label --
-		// and receivers that append a unit suffix during translation would then
-		// risk producing kube_pod_start_time_seconds_seconds. Populating this
-		// correctly needs a Unit on the family generator first.
-		md := metricdata.Metrics{
-			Name:        af.name,
-			Description: af.description,
-		}
-
-		switch af.familyType {
-		case ksmmetric.Gauge, ksmmetric.Info, ksmmetric.StateSet:
-			md.Data = metricdata.Gauge[float64]{DataPoints: af.points}
-		case ksmmetric.Counter:
-			md.Data = metricdata.Sum[float64]{
-				DataPoints:  af.points,
-				IsMonotonic: true,
-				Temporality: metricdata.CumulativeTemporality,
-			}
-		default:
-			// A Metrics with no Data is malformed, so drop the family rather
-			// than hand the exporter something it cannot encode.
-			klog.V(2).InfoS("Skipping metric family with an unsupported type", "family", af.name, "type", af.familyType)
-			continue
-		}
-
-		out = append(out, md)
-	}
-	return out
-}
-
-// createAttributes converts a metric's label keys and values into an attribute
-// set. It reports false when the two differ in length, which would otherwise
-// silently drop or mispair labels.
-func createAttributes(keys, values []string) (attribute.Set, bool) {
-	if len(keys) != len(values) {
-		return *attribute.EmptySet(), false
-	}
-	kv := make([]attribute.KeyValue, 0, len(keys))
-	for i, k := range keys {
-		kv = append(kv, attribute.String(k, values[i]))
-	}
-	return attribute.NewSet(kv...), true
 }

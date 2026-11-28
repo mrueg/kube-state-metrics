@@ -19,6 +19,7 @@ package metricsstore
 import (
 	"fmt"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 
@@ -27,6 +28,7 @@ import (
 
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
 	"k8s.io/kube-state-metrics/v2/pkg/metric"
@@ -741,5 +743,62 @@ func BenchmarkWriteAll(b *testing.B) {
 		if err := writer.WriteAll(&w); err != nil {
 			b.Fatal(err)
 		}
+	}
+}
+
+func TestFamiliesParsesHeaders(t *testing.T) {
+	headers := []string{
+		"# HELP kube_a_total Counts,\\nwith a \\\\ backslash.\n# TYPE kube_a_total counter",
+		"# HELP kube_b Info.\n# TYPE kube_b info\n",
+		"# TYPE kube_c stateset",
+	}
+	w := NewMetricsWriter("test", NewMetricsStore(headers, nil))
+	want := []FamilyMetadata{
+		{Name: "kube_a_total", Help: "Counts,\nwith a \\ backslash.", Type: "counter"},
+		{Name: "kube_b", Help: "Info.", Type: "info"},
+		{Name: "kube_c", Type: "stateset"},
+	}
+	if got := w.Families(); !reflect.DeepEqual(got, want) {
+		t.Errorf("Families() = %+v, want %+v", got, want)
+	}
+	if got := NewMetricsWriter("empty").Families(); got != nil {
+		t.Errorf("Families() of a writer without stores = %+v, want nil", got)
+	}
+}
+
+func TestRangeObjects(t *testing.T) {
+	gen := func(obj any) []metric.FamilyInterface {
+		o, _ := meta.Accessor(obj)
+		return []metric.FamilyInterface{&metric.Family{Name: "kube_x", Metrics: []*metric.Metric{{LabelKeys: []string{"uid"}, LabelValues: []string{string(o.GetUID())}, Value: 1}}}}
+	}
+	headers := []string{"# HELP kube_x X.\n# TYPE kube_x gauge"}
+	var stores []*MetricsStore
+	for _, uid := range []string{"a", "b", "c"} {
+		s := NewMetricsStore(headers, gen)
+		if err := s.Add(&v1.Pod{ObjectMeta: metav1.ObjectMeta{UID: types.UID(uid)}}); err != nil {
+			t.Fatal(err)
+		}
+		stores = append(stores, s)
+	}
+	w := NewMetricsWriter("test", stores...)
+
+	var got []string
+	w.RangeObjects(func(families [][]byte) bool {
+		got = append(got, string(families[0]))
+		return true
+	})
+	slices.Sort(got)
+	want := []string{"kube_x{uid=\"a\"} 1\n", "kube_x{uid=\"b\"} 1\n", "kube_x{uid=\"c\"} 1\n"}
+	if !slices.Equal(got, want) {
+		t.Errorf("RangeObjects visited %q, want %q", got, want)
+	}
+
+	calls := 0
+	w.RangeObjects(func([][]byte) bool {
+		calls++
+		return false
+	})
+	if calls != 1 {
+		t.Errorf("RangeObjects called fn %d times after it returned false, want 1", calls)
 	}
 }
